@@ -1,4 +1,6 @@
 config/*.json
 .agents
 AGENTS.md
+SKILLS.md
 .micmaster-test
+docs

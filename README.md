@@ -122,6 +122,12 @@ The mixer also provides a master gain. Start the mix, then select
 `CABLE Output` as the microphone/input source in OBS or another recording
 application. Mixer channel and master settings are saved for later sessions.
 
+Select **Advanced** to reveal optional speech-mixing controls: configurable
+priority ducking with attack/release, a master limiter, per-microphone gate and
+compressor controls, low-cut filtering, stereo pan, alignment delay, phase
+inversion, and peak-hold/clipping counters. Advanced settings remain active
+when the panel is collapsed and are saved with the normal mixer settings.
+
 VB-CABLE must be installed and its endpoints must be available for this feature
 to work.
 
@@ -178,4 +184,3 @@ device refresh, metering, and any affected optional integrations.
   Files location and configured for the relevant capture endpoint.
 - **The mixer cannot start:** install VB-CABLE and confirm that `CABLE Input` and
   `CABLE Output` are enabled in Windows Sound settings.
-

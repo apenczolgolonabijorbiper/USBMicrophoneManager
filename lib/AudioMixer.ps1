@@ -6,6 +6,7 @@ Set-StrictMode -Version 2.0
 
 $script:AudioMixerWindow = $null
 $script:AudioMixerInputsChangedHandler = $null
+$script:WinRtEffectListHelperReady = $false
 
 function Set-AudioMixerInputsRefreshPending {
     <# Marks the open live mixer as needing an input reconciliation after the main inventory changes. #>
@@ -31,6 +32,53 @@ function Get-AudioMixerDeviceSignature {
     return (($parts | Sort-Object) -join ';')
 }
 
+function Initialize-WinRtEffectListHelper {
+    <# Compiles a tiny in-memory bridge for WinRT effect-definition collections under Windows PowerShell 5.1. #>
+    if ($script:WinRtEffectListHelperReady) { return }
+    if ('UsbMicrophoneManager.WinRtEffectListHelper' -as [type]) {
+        $script:WinRtEffectListHelperReady = $true
+        return
+    }
+
+    $windowsRoot = [Environment]::GetFolderPath('Windows')
+    $mediaMetadata = Join-Path $windowsRoot 'System32\WinMetadata\Windows.Media.winmd'
+    $foundationMetadata = Join-Path $windowsRoot 'System32\WinMetadata\Windows.Foundation.winmd'
+    $runtimeAssembly = Join-Path $windowsRoot 'Microsoft.NET\assembly\GAC_MSIL\System.Runtime\v4.0_4.0.0.0__b03f5f7f11d50a3a\System.Runtime.dll'
+    $winRtAssembly = [System.WindowsRuntimeSystemExtensions].Assembly.Location
+    foreach ($path in @($mediaMetadata,$foundationMetadata,$runtimeAssembly,$winRtAssembly)) {
+        if (-not (Test-Path -LiteralPath $path)) { throw "Required Windows audio metadata was not found: $path" }
+    }
+
+    $source = @'
+using System.Collections.Generic;
+using Windows.Media.Effects;
+
+namespace UsbMicrophoneManager
+{
+    public static class WinRtEffectListHelper
+    {
+        public static void Add(object list, object effect)
+        {
+            ((IList<IAudioEffectDefinition>)list).Add((IAudioEffectDefinition)effect);
+        }
+    }
+}
+'@
+    $provider = New-Object Microsoft.CSharp.CSharpCodeProvider
+    $parameters = New-Object System.CodeDom.Compiler.CompilerParameters
+    $parameters.GenerateExecutable = $false
+    $parameters.GenerateInMemory = $true
+    foreach ($reference in @($mediaMetadata,$foundationMetadata,$runtimeAssembly,$winRtAssembly)) {
+        [void]$parameters.ReferencedAssemblies.Add($reference)
+    }
+    $result = $provider.CompileAssemblyFromSource($parameters, $source)
+    if ($result.Errors.HasErrors) {
+        $messages = @($result.Errors | ForEach-Object { $_.ToString() })
+        throw "WinRT audio effect bridge compilation failed: $($messages -join '; ')"
+    }
+    $script:WinRtEffectListHelperReady = $true
+}
+
 function Initialize-AudioGraphRuntime {
     <# Loads Windows Runtime assemblies and audio types required by AudioGraph. #>
     Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction Stop
@@ -38,9 +86,15 @@ function Initialize-AudioGraphRuntime {
     $null = [Windows.Media.Devices.MediaDevice,Windows.Media.Devices,ContentType=WindowsRuntime]
     $null = [Windows.Media.Audio.AudioGraph,Windows.Media.Audio,ContentType=WindowsRuntime]
     $null = [Windows.Media.Audio.AudioGraphSettings,Windows.Media.Audio,ContentType=WindowsRuntime]
+    $null = [Windows.Media.Audio.AudioNodeEmitter,Windows.Media.Audio,ContentType=WindowsRuntime]
+    $null = [Windows.Media.Audio.SpatialAudioModel,Windows.Media.Audio,ContentType=WindowsRuntime]
+    $null = [Windows.Media.Audio.EqualizerEffectDefinition,Windows.Media.Audio,ContentType=WindowsRuntime]
+    $null = [Windows.Media.Audio.EchoEffectDefinition,Windows.Media.Audio,ContentType=WindowsRuntime]
+    $null = [Windows.Media.Audio.LimiterEffectDefinition,Windows.Media.Audio,ContentType=WindowsRuntime]
     $null = [Windows.Media.Render.AudioRenderCategory,Windows.Media,ContentType=WindowsRuntime]
     $null = [Windows.Media.Capture.MediaCategory,Windows.Media,ContentType=WindowsRuntime]
     $null = [Windows.Media.MediaProperties.AudioEncodingProperties,Windows.Media.MediaProperties,ContentType=WindowsRuntime]
+    Initialize-WinRtEffectListHelper
 }
 
 function Get-WinRtAsyncResult {
@@ -146,6 +200,13 @@ function Read-AudioMixerConfig {
     $config = @{
         MasterDb = 0.0
         LatencyMode = 'LowestLatency'
+        Advanced = @{
+            DuckDb = -20.0
+            DuckAttackMs = 80
+            DuckReleaseMs = 350
+            LimiterEnabled = $true
+            ClipThresholdDb = -1.0
+        }
         Channels = @{}
     }
     $path = Get-AudioMixerConfigPath -ProjectRoot $ProjectRoot
@@ -160,6 +221,14 @@ function Read-AudioMixerConfig {
             $latencyMode = 'LowestLatency'
         }
         $config.LatencyMode = $latencyMode
+        $advanced = Get-ObjectPropertyValue -Object $json -Name 'Advanced' -Default $null
+        if ($advanced) {
+            $config.Advanced.DuckDb = [double](Get-ObjectPropertyValue -Object $advanced -Name 'DuckDb' -Default -20)
+            $config.Advanced.DuckAttackMs = [int](Get-ObjectPropertyValue -Object $advanced -Name 'DuckAttackMs' -Default 80)
+            $config.Advanced.DuckReleaseMs = [int](Get-ObjectPropertyValue -Object $advanced -Name 'DuckReleaseMs' -Default 350)
+            $config.Advanced.LimiterEnabled = ConvertTo-StorageBoolean -Value (Get-ObjectPropertyValue -Object $advanced -Name 'LimiterEnabled' -Default $true) -Default $true
+            $config.Advanced.ClipThresholdDb = [double](Get-ObjectPropertyValue -Object $advanced -Name 'ClipThresholdDb' -Default -1)
+        }
         $channels = Get-ObjectPropertyValue -Object $json -Name 'Channels' -Default $null
         if ($channels) {
             foreach ($property in $channels.PSObject.Properties) {
@@ -170,6 +239,15 @@ function Read-AudioMixerConfig {
                     Mute = ConvertTo-StorageBoolean -Value (Get-ObjectPropertyValue -Object $property.Value -Name 'Mute' -Default $false) -Default $false
                     Priority = ConvertTo-StorageBoolean -Value (Get-ObjectPropertyValue -Object $property.Value -Name 'Priority' -Default $false) -Default $false
                     Solo = ConvertTo-StorageBoolean -Value (Get-ObjectPropertyValue -Object $property.Value -Name 'Solo' -Default $false) -Default $false
+                    GateEnabled = ConvertTo-StorageBoolean -Value (Get-ObjectPropertyValue -Object $property.Value -Name 'GateEnabled' -Default $false) -Default $false
+                    GateThresholdDb = [double](Get-ObjectPropertyValue -Object $property.Value -Name 'GateThresholdDb' -Default -45)
+                    CompressorEnabled = ConvertTo-StorageBoolean -Value (Get-ObjectPropertyValue -Object $property.Value -Name 'CompressorEnabled' -Default $false) -Default $false
+                    CompressorThresholdDb = [double](Get-ObjectPropertyValue -Object $property.Value -Name 'CompressorThresholdDb' -Default -18)
+                    CompressorRatio = [double](Get-ObjectPropertyValue -Object $property.Value -Name 'CompressorRatio' -Default 3)
+                    HighPassHz = [int](Get-ObjectPropertyValue -Object $property.Value -Name 'HighPassHz' -Default 0)
+                    Pan = [int](Get-ObjectPropertyValue -Object $property.Value -Name 'Pan' -Default 0)
+                    DelayMs = [int](Get-ObjectPropertyValue -Object $property.Value -Name 'DelayMs' -Default 0)
+                    PhaseInvert = ConvertTo-StorageBoolean -Value (Get-ObjectPropertyValue -Object $property.Value -Name 'PhaseInvert' -Default $false) -Default $false
                 }
             }
         }
@@ -187,6 +265,7 @@ function Save-AudioMixerConfig {
         [Parameter(Mandatory=$true)][AllowEmptyCollection()][object[]]$Channels,
         [double]$MasterDb,
         [ValidateSet('SystemDefault','LowestLatency')][string]$LatencyMode = 'LowestLatency',
+        [hashtable]$AdvancedSettings,
         [scriptblock]$Logger
     )
 
@@ -201,6 +280,15 @@ function Save-AudioMixerConfig {
             Mute = [bool]$saved.Mute
             Priority = [bool]$saved.Priority
             Solo = [bool]$saved.Solo
+            GateEnabled = [bool]$saved.GateEnabled
+            GateThresholdDb = [double]$saved.GateThresholdDb
+            CompressorEnabled = [bool]$saved.CompressorEnabled
+            CompressorThresholdDb = [double]$saved.CompressorThresholdDb
+            CompressorRatio = [double]$saved.CompressorRatio
+            HighPassHz = [int]$saved.HighPassHz
+            Pan = [int]$saved.Pan
+            DelayMs = [int]$saved.DelayMs
+            PhaseInvert = [bool]$saved.PhaseInvert
         }
     }
     foreach ($channel in $Channels) {
@@ -212,11 +300,28 @@ function Save-AudioMixerConfig {
             Mute = [bool]$channel.Mute
             Priority = [bool]$channel.Priority
             Solo = [bool]$channel.Solo
+            GateEnabled = [bool]$channel.GateEnabled
+            GateThresholdDb = [double]$channel.GateThresholdDb
+            CompressorEnabled = [bool]$channel.CompressorEnabled
+            CompressorThresholdDb = [double]$channel.CompressorThresholdDb
+            CompressorRatio = [double]$channel.CompressorRatio
+            HighPassHz = [int]$channel.HighPassHz
+            Pan = [int]$channel.Pan
+            DelayMs = [int]$channel.DelayMs
+            PhaseInvert = [bool]$channel.PhaseInvert
         }
     }
+    if (-not $AdvancedSettings) { $AdvancedSettings = $existingConfig.Advanced }
     $root = [ordered]@{
         MasterDb = [double]$MasterDb
         LatencyMode = $LatencyMode
+        Advanced = [ordered]@{
+            DuckDb = [double]$AdvancedSettings.DuckDb
+            DuckAttackMs = [int]$AdvancedSettings.DuckAttackMs
+            DuckReleaseMs = [int]$AdvancedSettings.DuckReleaseMs
+            LimiterEnabled = [bool]$AdvancedSettings.LimiterEnabled
+            ClipThresholdDb = [double]$AdvancedSettings.ClipThresholdDb
+        }
         Channels = $channelRoot
     }
 
@@ -261,13 +366,23 @@ function Stop-AudioGraphMixer {
 }
 
 function Update-AudioGraphMixerGains {
-    <# Applies channel enable, mute, solo, fader, and master values to a running AudioGraph. #>
+    <# Applies faders, switching, ducking, gate, compressor, phase, and master gain. #>
     param(
         [Parameter(Mandatory=$true)][object]$Runtime,
         [Parameter(Mandatory=$true)][AllowEmptyCollection()][object[]]$ChannelStates,
-        [double]$MasterDb
+        [double]$MasterDb,
+        [hashtable]$AdvancedSettings,
+        [int]$DeltaMs = 100,
+        [switch]$Immediate
     )
 
+    if (-not $AdvancedSettings) {
+        $AdvancedSettings = @{
+            DuckDb = -20.0
+            DuckAttackMs = 80
+            DuckReleaseMs = 350
+        }
+    }
     $hasSolo = @($ChannelStates | Where-Object { $_.Enabled -and $_.Solo }).Count -gt 0
     $hasPriority = @($ChannelStates | Where-Object {
         $_.Enabled -and
@@ -281,23 +396,140 @@ function Update-AudioGraphMixerGains {
         } | Select-Object -First 1
         if ($null -eq $state) {
             $runtimeChannel.Node.OutgoingGain = 0.0
+            $runtimeChannel.CurrentGainDb = -100.0
             continue
         }
 
         $audible = [bool]$state.Enabled -and -not [bool]$state.Mute
         if ($hasSolo -and -not [bool]$state.Solo) { $audible = $false }
-        $runtimeChannel.Node.OutgoingGain = if ($audible) {
-            $effectiveGainDb = [double]$state.GainDb
+
+        $targetGainDb = -100.0
+        if ($audible) {
+            $targetGainDb = [double]$state.GainDb
             if ($hasPriority -and -not [bool]$state.Priority) {
-                $effectiveGainDb -= 20.0
+                $targetGainDb += [double]$AdvancedSettings.DuckDb
             }
-            Convert-DecibelsToLinearGain -Decibels $effectiveGainDb
+
+            $peak = [Math]::Max(0.000001, [double]$state.Peak)
+            $peakDb = 20.0 * [Math]::Log10($peak)
+            if ([bool]$state.GateEnabled -and $peakDb -lt [double]$state.GateThresholdDb) {
+                $targetGainDb = -100.0
+            }
+            elseif ([bool]$state.CompressorEnabled -and $peakDb -gt [double]$state.CompressorThresholdDb) {
+                $ratio = [Math]::Max(1.0, [double]$state.CompressorRatio)
+                $overDb = $peakDb - [double]$state.CompressorThresholdDb
+                $targetGainDb -= $overDb * (1.0 - (1.0 / $ratio))
+            }
+        }
+
+        $currentGainDb = [double]$runtimeChannel.CurrentGainDb
+        if ($Immediate) {
+            $currentGainDb = $targetGainDb
         }
         else {
-            0.0
+            $transitionMs = if ($targetGainDb -lt $currentGainDb) {
+                [Math]::Max(0, [int]$AdvancedSettings.DuckAttackMs)
+            }
+            else {
+                [Math]::Max(0, [int]$AdvancedSettings.DuckReleaseMs)
+            }
+            $fraction = if ($transitionMs -le 0) { 1.0 } else { [Math]::Min(1.0, [double]$DeltaMs / [double]$transitionMs) }
+            $currentGainDb += ($targetGainDb - $currentGainDb) * $fraction
+            if ([Math]::Abs($targetGainDb - $currentGainDb) -lt 0.1) { $currentGainDb = $targetGainDb }
         }
+
+        $runtimeChannel.CurrentGainDb = $currentGainDb
+        $linearGain = Convert-DecibelsToLinearGain -Decibels $currentGainDb
+        if ([bool]$state.PhaseInvert) { $linearGain = -$linearGain }
+        $runtimeChannel.Node.OutgoingGain = $linearGain
     }
     $Runtime.MixNode.OutgoingGain = Convert-DecibelsToLinearGain -Decibels $MasterDb
+}
+
+function Update-AudioGraphMixerEffects {
+    <# Applies platform equalizer, delay, limiter, and spatial-pan settings to a running graph. #>
+    param(
+        [Parameter(Mandatory=$true)][object]$Runtime,
+        [Parameter(Mandatory=$true)][AllowEmptyCollection()][object[]]$ChannelStates,
+        [hashtable]$AdvancedSettings,
+        [scriptblock]$Logger
+    )
+
+    foreach ($runtimeChannel in @($Runtime.Channels)) {
+        $state = $ChannelStates | Where-Object {
+            (Normalize-DeviceId $_.Device.InstanceId) -eq $runtimeChannel.Key
+        } | Select-Object -First 1
+        if ($null -eq $state) { continue }
+
+        try {
+            $panPosition = [single]([Math]::Max(-100, [Math]::Min(100, [int]$state.Pan)) / 100.0)
+            $runtimeChannel.Emitter.Position = New-Object System.Numerics.Vector3($panPosition, [single]0, [single]1)
+        }
+        catch {
+            Write-AppLog -Message ("Applying pan failed for {0}: {1}" -f $state.Device.FriendlyName, $_.Exception.Message) -Level WARN -Logger $Logger
+        }
+
+        try {
+            if ([int]$state.HighPassHz -gt 0) {
+                if ($null -eq $runtimeChannel.EqualizerEffect) {
+                    $runtimeChannel.EqualizerEffect = New-Object Windows.Media.Audio.EqualizerEffectDefinition ($Runtime.Graph)
+                    [UsbMicrophoneManager.WinRtEffectListHelper]::Add($runtimeChannel.Node.EffectDefinitions, $runtimeChannel.EqualizerEffect)
+                }
+                $cutoff = [double]$state.HighPassHz
+                $bands = @($runtimeChannel.EqualizerEffect.Bands)
+                $lowBand = $bands[0]
+                $lowBand.FrequencyCenter = [Math]::Max(30.0, $cutoff / 2.0)
+                $lowBand.Bandwidth = 1.0
+                $lowBand.Gain = [Math]::Pow(10.0, -12.0 / 20.0)
+                if ($bands.Count -gt 1) {
+                    $cutoffBand = $bands[1]
+                    $cutoffBand.FrequencyCenter = $cutoff
+                    $cutoffBand.Bandwidth = 1.0
+                    $cutoffBand.Gain = [Math]::Pow(10.0, -12.0 / 20.0)
+                }
+                $runtimeChannel.Node.EnableEffectsByDefinition($runtimeChannel.EqualizerEffect)
+            }
+            elseif ($runtimeChannel.EqualizerEffect) {
+                $runtimeChannel.Node.DisableEffectsByDefinition($runtimeChannel.EqualizerEffect)
+            }
+        }
+        catch {
+            Write-AppLog -Message ("Applying high-pass filter failed for {0}: {1}" -f $state.Device.FriendlyName, $_.Exception.Message) -Level WARN -Logger $Logger
+        }
+
+        try {
+            if ([int]$state.DelayMs -gt 0) {
+                if ($null -eq $runtimeChannel.DelayEffect) {
+                    $runtimeChannel.DelayEffect = New-Object Windows.Media.Audio.EchoEffectDefinition ($Runtime.Graph)
+                    $runtimeChannel.DelayEffect.Feedback = 0.0
+                    $runtimeChannel.DelayEffect.WetDryMix = 1.0
+                    [UsbMicrophoneManager.WinRtEffectListHelper]::Add($runtimeChannel.Node.EffectDefinitions, $runtimeChannel.DelayEffect)
+                }
+                $runtimeChannel.DelayEffect.Delay = [double][Math]::Max(1, [Math]::Min(200, [int]$state.DelayMs))
+                $runtimeChannel.Node.EnableEffectsByDefinition($runtimeChannel.DelayEffect)
+            }
+            elseif ($runtimeChannel.DelayEffect) {
+                $runtimeChannel.Node.DisableEffectsByDefinition($runtimeChannel.DelayEffect)
+            }
+        }
+        catch {
+            Write-AppLog -Message ("Applying delay failed for {0}: {1}" -f $state.Device.FriendlyName, $_.Exception.Message) -Level WARN -Logger $Logger
+        }
+    }
+
+    if ($AdvancedSettings -and $Runtime.MasterLimiter) {
+        try {
+            if ([bool]$AdvancedSettings.LimiterEnabled) {
+                $Runtime.MixNode.EnableEffectsByDefinition($Runtime.MasterLimiter)
+            }
+            else {
+                $Runtime.MixNode.DisableEffectsByDefinition($Runtime.MasterLimiter)
+            }
+        }
+        catch {
+            Write-AppLog -Message ("Applying master limiter setting failed: {0}" -f $_.Exception.Message) -Level WARN -Logger $Logger
+        }
+    }
 }
 
 function Get-AudioGraphCaptureDeviceMap {
@@ -331,11 +563,18 @@ function Add-AudioGraphMixerInput {
     }
 
     $inputResultType = [Windows.Media.Audio.CreateAudioDeviceInputNodeResult,Windows.Media.Audio,ContentType=WindowsRuntime]
-    $encoding = $null
+    $encoding = [Windows.Media.MediaProperties.AudioEncodingProperties]::CreatePcm(
+        $Runtime.Graph.EncodingProperties.SampleRate,
+        1,
+        32
+    )
+    $emitter = New-Object Windows.Media.Audio.AudioNodeEmitter
+    $emitter.SpatialAudioModel = [Windows.Media.Audio.SpatialAudioModel]::FoldDown
     $operation = $Runtime.Graph.CreateDeviceInputNodeAsync(
         [Windows.Media.Capture.MediaCategory]::Other,
         $encoding,
-        $CaptureByGuid[$endpointGuid]
+        $CaptureByGuid[$endpointGuid],
+        $emitter
     )
     $inputResult = Get-WinRtAsyncResult -Operation $operation -ResultType $inputResultType
     if ($inputResult.Status.ToString() -ne 'Success' -or $null -eq $inputResult.DeviceInputNode) {
@@ -349,6 +588,10 @@ function Add-AudioGraphMixerInput {
         Key = $key
         Device = $Device
         Node = $inputResult.DeviceInputNode
+        Emitter = $emitter
+        EqualizerEffect = $null
+        DelayEffect = $null
+        CurrentGainDb = -100.0
     }
     Write-AppLog -Message ("Mixer input joined live: {0}." -f $Device.FriendlyName) -Level DEVICE -Logger $Logger
     return $true
@@ -386,6 +629,7 @@ function Start-AudioGraphMixer {
         [Parameter(Mandatory=$true)][AllowEmptyCollection()][object[]]$ChannelStates,
         [double]$MasterDb,
         [ValidateSet('SystemDefault','LowestLatency')][string]$LatencyMode = 'LowestLatency',
+        [hashtable]$AdvancedSettings,
         [scriptblock]$Logger
     )
 
@@ -411,6 +655,7 @@ function Start-AudioGraphMixer {
             Graph = $graphResult.Graph
             OutputNode = $null
             MixNode = $null
+            MasterLimiter = $null
             Channels = @()
             Output = $OutputEndpoint
         }
@@ -422,6 +667,8 @@ function Start-AudioGraphMixer {
         }
         $runtime.OutputNode = $outputResult.DeviceOutputNode
         $runtime.MixNode = $runtime.Graph.CreateSubmixNode()
+        $runtime.MasterLimiter = New-Object Windows.Media.Audio.LimiterEffectDefinition ($runtime.Graph)
+        [UsbMicrophoneManager.WinRtEffectListHelper]::Add($runtime.MixNode.EffectDefinitions, $runtime.MasterLimiter)
         $runtime.MixNode.AddOutgoingConnection($runtime.OutputNode)
 
         $captureByGuid = Get-AudioGraphCaptureDeviceMap
@@ -430,7 +677,8 @@ function Start-AudioGraphMixer {
         }
 
         if ($runtime.Channels.Count -eq 0) { throw 'No selected microphone could be opened by AudioGraph.' }
-        Update-AudioGraphMixerGains -Runtime $runtime -ChannelStates $ChannelStates -MasterDb $MasterDb
+        Update-AudioGraphMixerEffects -Runtime $runtime -ChannelStates $ChannelStates -AdvancedSettings $AdvancedSettings -Logger $Logger
+        Update-AudioGraphMixerGains -Runtime $runtime -ChannelStates $ChannelStates -MasterDb $MasterDb -AdvancedSettings $AdvancedSettings -Immediate
         $runtime.Graph.Start()
         Write-AppLog -Message ("Mixer started: {0} input(s) -> {1}; latency mode: {2}." -f $runtime.Channels.Count, $OutputEndpoint.Name, $LatencyMode) -Level INFO -Logger $Logger
         return $runtime
@@ -455,11 +703,29 @@ function New-AudioMixerChannelStrip {
     $mute = $false
     $priority = $false
     $solo = $false
+    $gateEnabled = $false
+    $gateThresholdDb = -45.0
+    $compressorEnabled = $false
+    $compressorThresholdDb = -18.0
+    $compressorRatio = 3.0
+    $highPassHz = 0
+    $pan = 0
+    $delayMs = 0
+    $phaseInvert = $false
     if ($SavedSettings) {
         $gainDb = [double]$SavedSettings.GainDb
         $mute = [bool]$SavedSettings.Mute
         $priority = [bool]$SavedSettings.Priority
         $solo = [bool]$SavedSettings.Solo
+        $gateEnabled = [bool]$SavedSettings.GateEnabled
+        $gateThresholdDb = [double]$SavedSettings.GateThresholdDb
+        $compressorEnabled = [bool]$SavedSettings.CompressorEnabled
+        $compressorThresholdDb = [double]$SavedSettings.CompressorThresholdDb
+        $compressorRatio = [double]$SavedSettings.CompressorRatio
+        $highPassHz = [int]$SavedSettings.HighPassHz
+        $pan = [int]$SavedSettings.Pan
+        $delayMs = [int]$SavedSettings.DelayMs
+        $phaseInvert = [bool]$SavedSettings.PhaseInvert
     }
     if ($gainDb -lt -60) { $gainDb = -60 }
     if ($gainDb -gt 12) { $gainDb = 12 }
@@ -471,6 +737,19 @@ function New-AudioMixerChannelStrip {
         Mute = $mute
         Priority = $priority
         Solo = $solo
+        GateEnabled = $gateEnabled
+        GateThresholdDb = $gateThresholdDb
+        CompressorEnabled = $compressorEnabled
+        CompressorThresholdDb = $compressorThresholdDb
+        CompressorRatio = $compressorRatio
+        HighPassHz = $highPassHz
+        Pan = $pan
+        DelayMs = $delayMs
+        PhaseInvert = $phaseInvert
+        Peak = 0.0
+        PeakHold = 0.0
+        ClipCount = 0
+        Clipping = $false
         Panel = $null
         Meter = $null
         GainLabel = $null
@@ -674,12 +953,13 @@ function Show-AudioMixerWindow {
 
     $root = New-Object System.Windows.Forms.TableLayoutPanel
     $root.Dock = 'Fill'
-    $root.RowCount = 4
+    $root.RowCount = 5
     $root.ColumnCount = 1
     $root.Padding = New-Object System.Windows.Forms.Padding(12)
     [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 58)))
     [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 58)))
     [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 52)))
+    [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 0)))
     [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Percent', 100)))
     $form.Controls.Add($root)
 
@@ -744,7 +1024,9 @@ function Show-AudioMixerWindow {
     $btnMix.ForeColor = [System.Drawing.Color]::White
     $btnRefresh = New-ToolbarButton -Text 'Refresh Inputs' -Icon 'R'
     $refreshButtonNormalColor = $btnRefresh.BackColor
-    foreach ($control in @($outputLabel,$cmbOutput,$latencyLabel,$cmbLatency,$btnMix,$btnRefresh)) {
+    $btnAdvanced = New-ToolbarButton -Text 'Advanced' -Icon '...'
+    $btnAdvanced.Text = 'Advanced'
+    foreach ($control in @($outputLabel,$cmbOutput,$latencyLabel,$cmbLatency,$btnMix,$btnRefresh,$btnAdvanced)) {
         [void]$toolbar.Controls.Add($control)
     }
     $root.Controls.Add($toolbar, 0, 1)
@@ -783,6 +1065,100 @@ function Show-AudioMixerWindow {
     }
     $root.Controls.Add($masterToolbar, 0, 2)
 
+    $advancedPanel = New-Object System.Windows.Forms.FlowLayoutPanel
+    $advancedPanel.Dock = 'Fill'
+    $advancedPanel.Visible = $false
+    $advancedPanel.WrapContents = $true
+    $advancedPanel.AutoScroll = $true
+    $advancedPanel.Padding = New-Object System.Windows.Forms.Padding(4)
+    $advancedPanel.BackColor = [System.Drawing.Color]::FromArgb(30, 41, 59)
+
+    $newAdvancedLabel = {
+        param([string]$Text)
+        $label = New-Object System.Windows.Forms.Label
+        $label.Text = $Text
+        $label.AutoSize = $true
+        $label.Margin = New-Object System.Windows.Forms.Padding(7, 9, 3, 0)
+        $label.ForeColor = [System.Drawing.Color]::FromArgb(203, 213, 225)
+        return $label
+    }
+    $newAdvancedNumber = {
+        param([decimal]$Minimum, [decimal]$Maximum, [int]$Width)
+        $number = New-Object System.Windows.Forms.NumericUpDown
+        $number.Minimum = $Minimum
+        $number.Maximum = $Maximum
+        $number.Width = $Width
+        $number.Margin = New-Object System.Windows.Forms.Padding(0, 5, 3, 0)
+        return $number
+    }
+
+    $numDuckDb = & $newAdvancedNumber -30 -3 55
+    $numDuckAttack = & $newAdvancedNumber 0 1000 65
+    $numDuckRelease = & $newAdvancedNumber 0 3000 65
+    $chkLimiter = New-Object System.Windows.Forms.CheckBox
+    $chkLimiter.Text = 'Limiter'
+    $chkLimiter.AutoSize = $true
+    $chkLimiter.Margin = New-Object System.Windows.Forms.Padding(8, 8, 3, 0)
+    $chkLimiter.ForeColor = [System.Drawing.Color]::White
+    $numClipThreshold = & $newAdvancedNumber -12 0 55
+    $cmbAdvancedChannel = New-Object System.Windows.Forms.ComboBox
+    $cmbAdvancedChannel.DropDownStyle = 'DropDownList'
+    $cmbAdvancedChannel.DisplayMember = 'Name'
+    $cmbAdvancedChannel.Width = 180
+    $cmbAdvancedChannel.Margin = New-Object System.Windows.Forms.Padding(8, 5, 3, 0)
+    $chkGate = New-Object System.Windows.Forms.CheckBox
+    $chkGate.Text = 'Gate'
+    $chkGate.AutoSize = $true
+    $chkGate.Margin = New-Object System.Windows.Forms.Padding(8, 8, 3, 0)
+    $chkGate.ForeColor = [System.Drawing.Color]::White
+    $numGateThreshold = & $newAdvancedNumber -80 -10 55
+    $chkCompressor = New-Object System.Windows.Forms.CheckBox
+    $chkCompressor.Text = 'Compressor'
+    $chkCompressor.AutoSize = $true
+    $chkCompressor.Margin = New-Object System.Windows.Forms.Padding(8, 8, 3, 0)
+    $chkCompressor.ForeColor = [System.Drawing.Color]::White
+    $numCompressorThreshold = & $newAdvancedNumber -50 -3 55
+    $numCompressorRatio = & $newAdvancedNumber 1 10 50
+    $numCompressorRatio.DecimalPlaces = 1
+    $numCompressorRatio.Increment = [decimal]0.5
+    $cmbHighPass = New-Object System.Windows.Forms.ComboBox
+    $cmbHighPass.DropDownStyle = 'DropDownList'
+    $cmbHighPass.Width = 70
+    $cmbHighPass.Margin = New-Object System.Windows.Forms.Padding(0, 5, 3, 0)
+    foreach ($value in @('Off','80','100','120')) { [void]$cmbHighPass.Items.Add($value) }
+    $numPan = & $newAdvancedNumber -100 100 60
+    $numDelay = & $newAdvancedNumber 0 200 60
+    $chkPhase = New-Object System.Windows.Forms.CheckBox
+    $chkPhase.Text = 'Invert phase'
+    $chkPhase.AutoSize = $true
+    $chkPhase.Margin = New-Object System.Windows.Forms.Padding(8, 8, 3, 0)
+    $chkPhase.ForeColor = [System.Drawing.Color]::White
+    $peakHoldLabel = New-Object System.Windows.Forms.Label
+    $peakHoldLabel.Text = 'Peak dBFS/clips: Master -inf/0 | Channel -inf/0'
+    $peakHoldLabel.AutoSize = $true
+    $peakHoldLabel.Margin = New-Object System.Windows.Forms.Padding(8, 9, 3, 0)
+    $peakHoldLabel.ForeColor = [System.Drawing.Color]::FromArgb(74, 222, 128)
+    $btnResetPeaks = New-ToolbarButton -Text 'Reset peaks' -Icon 'R'
+    $btnResetPeaks.Height = 28
+
+    foreach ($control in @(
+        (& $newAdvancedLabel 'DUCK dB'),$numDuckDb,
+        (& $newAdvancedLabel 'ATTACK ms'),$numDuckAttack,
+        (& $newAdvancedLabel 'RELEASE ms'),$numDuckRelease,
+        $chkLimiter,(& $newAdvancedLabel 'CLIP dBFS'),$numClipThreshold,
+        (& $newAdvancedLabel 'CHANNEL'),$cmbAdvancedChannel,
+        $chkGate,(& $newAdvancedLabel 'THR dB'),$numGateThreshold,
+        $chkCompressor,(& $newAdvancedLabel 'THR dB'),$numCompressorThreshold,
+        (& $newAdvancedLabel 'RATIO'),$numCompressorRatio,
+        (& $newAdvancedLabel 'HPF Hz'),$cmbHighPass,
+        (& $newAdvancedLabel 'PAN'),$numPan,
+        (& $newAdvancedLabel 'DELAY ms'),$numDelay,
+        $chkPhase,$peakHoldLabel,$btnResetPeaks
+    )) {
+        [void]$advancedPanel.Controls.Add($control)
+    }
+    $root.Controls.Add($advancedPanel, 0, 3)
+
     $channelHost = New-Object System.Windows.Forms.FlowLayoutPanel
     $channelHost.Dock = 'Fill'
     $channelHost.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
@@ -790,7 +1166,7 @@ function Show-AudioMixerWindow {
     $channelHost.AutoScroll = $true
     $channelHost.Padding = New-Object System.Windows.Forms.Padding(4)
     $channelHost.BackColor = [System.Drawing.Color]::FromArgb(17, 24, 39)
-    $root.Controls.Add($channelHost, 0, 3)
+    $root.Controls.Add($channelHost, 0, 4)
 
     $config = Read-AudioMixerConfig -ProjectRoot $ProjectRoot -Logger $Logger
     $masterDb = [double]$config.MasterDb
@@ -799,10 +1175,26 @@ function Show-AudioMixerWindow {
     $masterFader.Value = [int][Math]::Round($masterDb)
     $masterValue.Text = ('{0:+0;-0;0} dB' -f $masterDb)
     $cmbLatency.SelectedIndex = if ($config.LatencyMode -eq 'SystemDefault') { 0 } else { 1 }
+    $advancedSettings = @{
+        DuckDb = [Math]::Max(-30, [Math]::Min(-3, [double]$config.Advanced.DuckDb))
+        DuckAttackMs = [Math]::Max(0, [Math]::Min(1000, [int]$config.Advanced.DuckAttackMs))
+        DuckReleaseMs = [Math]::Max(0, [Math]::Min(3000, [int]$config.Advanced.DuckReleaseMs))
+        LimiterEnabled = [bool]$config.Advanced.LimiterEnabled
+        ClipThresholdDb = [Math]::Max(-12, [Math]::Min(0, [double]$config.Advanced.ClipThresholdDb))
+    }
+    $numDuckDb.Value = [decimal]$advancedSettings.DuckDb
+    $numDuckAttack.Value = [decimal]$advancedSettings.DuckAttackMs
+    $numDuckRelease.Value = [decimal]$advancedSettings.DuckReleaseMs
+    $chkLimiter.Checked = [bool]$advancedSettings.LimiterEnabled
+    $numClipThreshold.Value = [decimal]$advancedSettings.ClipThresholdDb
 
     $mixerState = @{
         Runtime = $null
         Channels = @()
+        MasterPeakHold = 0.0
+        MasterClipCount = 0
+        MasterClipping = $false
+        AdvancedUiLoading = $false
     }
     $script:AudioMixerInputsChangedHandler = {
         if ($mixerState.Runtime -and -not $btnRefresh.IsDisposed) {
@@ -825,8 +1217,73 @@ function Show-AudioMixerWindow {
 
     $applyMix = {
         if ($mixerState.Runtime) {
-            Update-AudioGraphMixerGains -Runtime $mixerState.Runtime -ChannelStates $mixerState.Channels -MasterDb ([double]$masterFader.Value)
+            Update-AudioGraphMixerGains -Runtime $mixerState.Runtime -ChannelStates $mixerState.Channels -MasterDb ([double]$masterFader.Value) -AdvancedSettings $advancedSettings -DeltaMs 50
         }
+    }.GetNewClosure()
+
+    $applyEffects = {
+        if ($mixerState.Runtime) {
+            Update-AudioGraphMixerEffects -Runtime $mixerState.Runtime -ChannelStates $mixerState.Channels -AdvancedSettings $advancedSettings -Logger $Logger
+        }
+    }.GetNewClosure()
+
+    $loadAdvancedChannelControls = {
+        $mixerState.AdvancedUiLoading = $true
+        try {
+            $wrapper = $cmbAdvancedChannel.SelectedItem
+            $state = if ($wrapper) { $wrapper.State } else { $null }
+            $enabled = $null -ne $state
+            foreach ($control in @($chkGate,$numGateThreshold,$chkCompressor,$numCompressorThreshold,$numCompressorRatio,$cmbHighPass,$numPan,$numDelay,$chkPhase)) {
+                $control.Enabled = $enabled
+            }
+            if (-not $enabled) { return }
+
+            $chkGate.Checked = [bool]$state.GateEnabled
+            $numGateThreshold.Value = [decimal][Math]::Max(-80, [Math]::Min(-10, [double]$state.GateThresholdDb))
+            $chkCompressor.Checked = [bool]$state.CompressorEnabled
+            $numCompressorThreshold.Value = [decimal][Math]::Max(-50, [Math]::Min(-3, [double]$state.CompressorThresholdDb))
+            $numCompressorRatio.Value = [decimal][Math]::Max(1, [Math]::Min(10, [double]$state.CompressorRatio))
+            $highPassText = if ([int]$state.HighPassHz -gt 0) { [string][int]$state.HighPassHz } else { 'Off' }
+            $cmbHighPass.SelectedItem = $highPassText
+            if ($cmbHighPass.SelectedIndex -lt 0) { $cmbHighPass.SelectedIndex = 0 }
+            $numPan.Value = [decimal][Math]::Max(-100, [Math]::Min(100, [int]$state.Pan))
+            $numDelay.Value = [decimal][Math]::Max(0, [Math]::Min(200, [int]$state.DelayMs))
+            $chkPhase.Checked = [bool]$state.PhaseInvert
+        }
+        finally {
+            $mixerState.AdvancedUiLoading = $false
+        }
+    }.GetNewClosure()
+
+    $saveAdvancedChannelControls = {
+        if ($mixerState.AdvancedUiLoading -or $null -eq $cmbAdvancedChannel.SelectedItem) { return }
+        $state = $cmbAdvancedChannel.SelectedItem.State
+        $state.GateEnabled = [bool]$chkGate.Checked
+        $state.GateThresholdDb = [double]$numGateThreshold.Value
+        $state.CompressorEnabled = [bool]$chkCompressor.Checked
+        $state.CompressorThresholdDb = [double]$numCompressorThreshold.Value
+        $state.CompressorRatio = [double]$numCompressorRatio.Value
+        $state.HighPassHz = if ($cmbHighPass.SelectedItem -and $cmbHighPass.SelectedItem.ToString() -ne 'Off') {
+            [int]$cmbHighPass.SelectedItem.ToString()
+        }
+        else {
+            0
+        }
+        $state.Pan = [int]$numPan.Value
+        $state.DelayMs = [int]$numDelay.Value
+        $state.PhaseInvert = [bool]$chkPhase.Checked
+        & $applyEffects
+        & $applyMix
+    }.GetNewClosure()
+
+    $saveAdvancedGlobalControls = {
+        $advancedSettings.DuckDb = [double]$numDuckDb.Value
+        $advancedSettings.DuckAttackMs = [int]$numDuckAttack.Value
+        $advancedSettings.DuckReleaseMs = [int]$numDuckRelease.Value
+        $advancedSettings.LimiterEnabled = [bool]$chkLimiter.Checked
+        $advancedSettings.ClipThresholdDb = [double]$numClipThreshold.Value
+        & $applyEffects
+        & $applyMix
     }.GetNewClosure()
 
     $setPriority = {
@@ -891,6 +1348,10 @@ function Show-AudioMixerWindow {
     $loadChannels = {
         param([bool]$RefreshInventory = $false)
 
+        $advancedSelectedKey = ''
+        if ($cmbAdvancedChannel.SelectedItem) {
+            $advancedSelectedKey = Normalize-DeviceId (ConvertTo-PlainString $cmbAdvancedChannel.SelectedItem.State.Device.InstanceId)
+        }
         $currentSettings = @{}
         foreach ($channel in $mixerState.Channels) {
             $key = Normalize-DeviceId (ConvertTo-PlainString $channel.Device.InstanceId)
@@ -901,6 +1362,15 @@ function Show-AudioMixerWindow {
                 Mute = [bool]$channel.Mute
                 Priority = [bool]$channel.Priority
                 Solo = [bool]$channel.Solo
+                GateEnabled = [bool]$channel.GateEnabled
+                GateThresholdDb = [double]$channel.GateThresholdDb
+                CompressorEnabled = [bool]$channel.CompressorEnabled
+                CompressorThresholdDb = [double]$channel.CompressorThresholdDb
+                CompressorRatio = [double]$channel.CompressorRatio
+                HighPassHz = [int]$channel.HighPassHz
+                Pan = [int]$channel.Pan
+                DelayMs = [int]$channel.DelayMs
+                PhaseInvert = [bool]$channel.PhaseInvert
             }
         }
         foreach ($key in @($currentSettings.Keys)) {
@@ -995,6 +1465,27 @@ function Show-AudioMixerWindow {
                 [void]$channelHost.Controls.Add($strip.Panel)
             }
             $mixerState.Channels = $newChannels
+            $mixerState.AdvancedUiLoading = $true
+            try {
+                $cmbAdvancedChannel.Items.Clear()
+                $selectedIndex = -1
+                foreach ($channel in $mixerState.Channels) {
+                    $item = [pscustomobject]@{
+                        Name = ConvertTo-PlainString $channel.Device.FriendlyName
+                        State = $channel
+                    }
+                    $index = $cmbAdvancedChannel.Items.Add($item)
+                    $key = Normalize-DeviceId (ConvertTo-PlainString $channel.Device.InstanceId)
+                    if ($key -eq $advancedSelectedKey) { $selectedIndex = $index }
+                }
+                if ($selectedIndex -lt 0 -and $cmbAdvancedChannel.Items.Count -gt 0) { $selectedIndex = 0 }
+                $cmbAdvancedChannel.SelectedIndex = $selectedIndex
+            }
+            finally {
+                $mixerState.AdvancedUiLoading = $false
+            }
+            & $loadAdvancedChannelControls
+            & $applyEffects
             & $applyMix
         }
         finally {
@@ -1018,6 +1509,7 @@ function Show-AudioMixerWindow {
                 -ChannelStates $mixerState.Channels `
                 -MasterDb ([double]$masterFader.Value) `
                 -LatencyMode (ConvertTo-PlainString $cmbLatency.SelectedItem.Mode) `
+                -AdvancedSettings $advancedSettings `
                 -Logger $Logger
             $btnMix.Text = 'Stop Mix'
             $mixBlinkState = $false
@@ -1057,6 +1549,41 @@ function Show-AudioMixerWindow {
             )
         }
     }.GetNewClosure())
+    $btnAdvanced.Add_Click({
+        $showAdvanced = -not $advancedPanel.Visible
+        $advancedPanel.Visible = $showAdvanced
+        $root.RowStyles[3].Height = if ($showAdvanced) { 128 } else { 0 }
+        $btnAdvanced.BackColor = if ($showAdvanced) {
+            [System.Drawing.Color]::FromArgb(191, 219, 254)
+        }
+        else {
+            [System.Drawing.Color]::FromArgb(248, 250, 252)
+        }
+    }.GetNewClosure())
+    foreach ($control in @($numDuckDb,$numDuckAttack,$numDuckRelease,$numClipThreshold)) {
+        $control.Add_ValueChanged($saveAdvancedGlobalControls)
+    }
+    $chkLimiter.Add_CheckedChanged($saveAdvancedGlobalControls)
+    $cmbAdvancedChannel.Add_SelectedIndexChanged($loadAdvancedChannelControls)
+    foreach ($control in @($numGateThreshold,$numCompressorThreshold,$numCompressorRatio,$numPan,$numDelay)) {
+        $control.Add_ValueChanged($saveAdvancedChannelControls)
+    }
+    foreach ($control in @($chkGate,$chkCompressor,$chkPhase)) {
+        $control.Add_CheckedChanged($saveAdvancedChannelControls)
+    }
+    $cmbHighPass.Add_SelectedIndexChanged($saveAdvancedChannelControls)
+    $btnResetPeaks.Add_Click({
+        $mixerState.MasterPeakHold = 0.0
+        $mixerState.MasterClipCount = 0
+        $mixerState.MasterClipping = $false
+        foreach ($channel in $mixerState.Channels) {
+            $channel.PeakHold = 0.0
+            $channel.ClipCount = 0
+            $channel.Clipping = $false
+        }
+        $peakHoldLabel.Text = 'Peak dBFS/clips: Master -inf/0 | Channel -inf/0'
+        $peakHoldLabel.ForeColor = [System.Drawing.Color]::FromArgb(74, 222, 128)
+    }.GetNewClosure())
     $masterFader.Add_Scroll({
         $masterValue.Text = ('{0:+0;-0;0} dB' -f [double]$masterFader.Value)
         & $applyMix
@@ -1068,10 +1595,18 @@ function Show-AudioMixerWindow {
         foreach ($channel in $mixerState.Channels) {
             try {
                 $peak = Get-AudioEndpointPeak -EndpointId (ConvertTo-PlainString $channel.Device.EndpointId) -Logger $null -Quiet
+                $channel.Peak = [double]$peak
+                if ($peak -gt $channel.PeakHold) { $channel.PeakHold = [double]$peak }
+                $channelClipLinear = [Math]::Pow(10.0, [double]$advancedSettings.ClipThresholdDb / 20.0)
+                $channelIsClipping = $peak -ge $channelClipLinear
+                if ($channelIsClipping -and -not $channel.Clipping) { $channel.ClipCount++ }
+                $channel.Clipping = $channelIsClipping
                 $value = [Math]::Max(0, [Math]::Min(100, [int][Math]::Round($peak * 100)))
                 $channel.Meter.Value = $value
             }
             catch {
+                $channel.Peak = 0.0
+                $channel.Clipping = $false
                 $channel.Meter.Value = 0
             }
         }
@@ -1079,7 +1614,46 @@ function Show-AudioMixerWindow {
             if ($mixerState.Runtime -and $cmbOutput.SelectedItem) {
                 $renderEndpointId = '{0.0.0.00000000}.' + (ConvertTo-PlainString $cmbOutput.SelectedItem.EndpointGuid)
                 $masterPeak = Get-AudioEndpointPeak -EndpointId $renderEndpointId -Logger $null -Quiet
+                if ($masterPeak -gt $mixerState.MasterPeakHold) { $mixerState.MasterPeakHold = [double]$masterPeak }
+                $clipLinear = [Math]::Pow(10.0, [double]$advancedSettings.ClipThresholdDb / 20.0)
+                $isClipping = $masterPeak -ge $clipLinear
+                if ($isClipping -and -not $mixerState.MasterClipping) {
+                    $mixerState.MasterClipCount++
+                }
+                $mixerState.MasterClipping = $isClipping
                 $masterMeter.Value = [Math]::Max(0, [Math]::Min(100, [int][Math]::Round($masterPeak * 100)))
+                $peakDb = if ($mixerState.MasterPeakHold -gt 0) {
+                    20.0 * [Math]::Log10($mixerState.MasterPeakHold)
+                }
+                else {
+                    -100.0
+                }
+                $selectedChannel = if ($cmbAdvancedChannel.SelectedItem) { $cmbAdvancedChannel.SelectedItem.State } else { $null }
+                $selectedPeakDb = if ($selectedChannel -and $selectedChannel.PeakHold -gt 0) {
+                    20.0 * [Math]::Log10($selectedChannel.PeakHold)
+                }
+                else {
+                    -100.0
+                }
+                $masterText = if ($peakDb -le -99) {
+                    "Master -inf/$($mixerState.MasterClipCount)"
+                }
+                else {
+                    "Master {0:N1}/{1}" -f $peakDb, $mixerState.MasterClipCount
+                }
+                $channelText = if ($selectedPeakDb -le -99) {
+                    'Channel -inf/0'
+                }
+                else {
+                    "Channel {0:N1}/{1}" -f $selectedPeakDb, $selectedChannel.ClipCount
+                }
+                $peakHoldLabel.Text = "Peak dBFS/clips: $masterText | $channelText"
+                $peakHoldLabel.ForeColor = if ($mixerState.MasterClipCount -gt 0 -or ($selectedChannel -and $selectedChannel.ClipCount -gt 0)) {
+                    [System.Drawing.Color]::FromArgb(248, 113, 113)
+                }
+                else {
+                    [System.Drawing.Color]::FromArgb(74, 222, 128)
+                }
             }
             else {
                 $masterMeter.Value = 0
@@ -1090,13 +1664,23 @@ function Show-AudioMixerWindow {
         }
     }.GetNewClosure())
 
+    $gainTimer = New-Object System.Windows.Forms.Timer
+    $gainTimer.Interval = 25
+    $gainTimer.Add_Tick({
+        if ($mixerState.Runtime) {
+            Update-AudioGraphMixerGains -Runtime $mixerState.Runtime -ChannelStates $mixerState.Channels -MasterDb ([double]$masterFader.Value) -AdvancedSettings $advancedSettings -DeltaMs $gainTimer.Interval
+        }
+    }.GetNewClosure())
+
     $form.Add_Shown({
         & $loadOutputs
         & $loadChannels $false
         $meterTimer.Start()
+        $gainTimer.Start()
     }.GetNewClosure())
     $form.Add_FormClosing({
         $meterTimer.Stop()
+        $gainTimer.Stop()
         $mixBlinkTimer.Stop()
         & $stopMix
         $latencyMode = if ($cmbLatency.SelectedItem) {
@@ -1105,7 +1689,7 @@ function Show-AudioMixerWindow {
         else {
             'LowestLatency'
         }
-        [void](Save-AudioMixerConfig -ProjectRoot $ProjectRoot -Channels $mixerState.Channels -MasterDb ([double]$masterFader.Value) -LatencyMode $latencyMode -Logger $Logger)
+        [void](Save-AudioMixerConfig -ProjectRoot $ProjectRoot -Channels $mixerState.Channels -MasterDb ([double]$masterFader.Value) -LatencyMode $latencyMode -AdvancedSettings $advancedSettings -Logger $Logger)
         $script:AudioMixerInputsChangedHandler = $null
         $script:AudioMixerWindow = $null
     }.GetNewClosure())
