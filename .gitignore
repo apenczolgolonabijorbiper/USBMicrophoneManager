@@ -1,3 +1,4 @@
 config/*.json
 .agents
+AGENTS.md
 .micmaster-test
