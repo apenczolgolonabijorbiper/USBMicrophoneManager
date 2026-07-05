@@ -368,7 +368,7 @@ function New-AudioMixerChannelStrip {
     }
 
     $panel = New-Object System.Windows.Forms.Panel
-    $panel.Size = New-Object System.Drawing.Size(176, 470)
+    $panel.Size = New-Object System.Drawing.Size(235, 470)
     $panel.Margin = New-Object System.Windows.Forms.Padding(8)
     $panel.Padding = New-Object System.Windows.Forms.Padding(10)
     $panel.BackColor = [System.Drawing.Color]::FromArgb(30, 41, 59)
@@ -376,9 +376,8 @@ function New-AudioMixerChannelStrip {
     $layout = New-Object System.Windows.Forms.TableLayoutPanel
     $layout.Dock = 'Fill'
     $layout.ColumnCount = 1
-    $layout.RowCount = 10
+    $layout.RowCount = 9
     [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 34)))
-    [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 24)))
     [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 42)))
     [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 30)))
     [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 26)))
@@ -391,7 +390,15 @@ function New-AudioMixerChannelStrip {
 
     $alias2 = ConvertTo-PlainString $Device.Alias2
     $alias1 = ConvertTo-PlainString $Device.Alias1
-    $titleText = if (-not [string]::IsNullOrWhiteSpace($alias2)) { $alias2 } elseif (-not [string]::IsNullOrWhiteSpace($alias1)) { $alias1 } else { $Device.FriendlyName }
+    $titleText = if (-not [string]::IsNullOrWhiteSpace($alias1) -and -not [string]::IsNullOrWhiteSpace($alias2)) {
+        '{0}: {1}' -f $alias1, $alias2
+    } elseif (-not [string]::IsNullOrWhiteSpace($alias1)) {
+        $alias1
+    } elseif (-not [string]::IsNullOrWhiteSpace($alias2)) {
+        $alias2
+    } else {
+        $Device.FriendlyName
+    }
 
     $title = New-Object System.Windows.Forms.Label
     $title.Text = $titleText
@@ -402,21 +409,13 @@ function New-AudioMixerChannelStrip {
     $title.TextAlign = 'MiddleCenter'
     $layout.Controls.Add($title, 0, 0)
 
-    $aliasLabel = New-Object System.Windows.Forms.Label
-    $aliasLabel.Text = ("A1: {0}   A2: {1}" -f $alias1, $alias2)
-    $aliasLabel.Dock = 'Fill'
-    $aliasLabel.AutoEllipsis = $true
-    $aliasLabel.ForeColor = [System.Drawing.Color]::FromArgb(148, 163, 184)
-    $aliasLabel.TextAlign = 'MiddleCenter'
-    $layout.Controls.Add($aliasLabel, 0, 1)
-
     $deviceLabel = New-Object System.Windows.Forms.Label
     $deviceLabel.Text = ConvertTo-PlainString $Device.FriendlyName
     $deviceLabel.Dock = 'Fill'
     $deviceLabel.AutoEllipsis = $true
     $deviceLabel.ForeColor = [System.Drawing.Color]::FromArgb(203, 213, 225)
     $deviceLabel.TextAlign = 'MiddleCenter'
-    $layout.Controls.Add($deviceLabel, 0, 2)
+    $layout.Controls.Add($deviceLabel, 0, 1)
 
     $enableControl = New-Object System.Windows.Forms.CheckBox
     $enableControl.Text = 'IN MIX'
@@ -425,14 +424,18 @@ function New-AudioMixerChannelStrip {
     $enableControl.TextAlign = 'MiddleCenter'
     $enableControl.CheckAlign = 'MiddleLeft'
     $enableControl.ForeColor = [System.Drawing.Color]::FromArgb(226, 232, 240)
-    $layout.Controls.Add($enableControl, 0, 3)
+    $layout.Controls.Add($enableControl, 0, 2)
 
     $meter = New-Object System.Windows.Forms.ProgressBar
     $meter.Dock = 'Fill'
     $meter.Minimum = 0
     $meter.Maximum = 100
     $meter.Style = [System.Windows.Forms.ProgressBarStyle]::Continuous
-    $layout.Controls.Add($meter, 0, 4)
+    $layout.Controls.Add($meter, 0, 3)
+
+    $faderHost = New-Object System.Windows.Forms.Panel
+    $faderHost.Dock = 'Fill'
+    $faderHost.Margin = New-Object System.Windows.Forms.Padding(0)
 
     $fader = New-Object System.Windows.Forms.TrackBar
     $fader.Orientation = [System.Windows.Forms.Orientation]::Vertical
@@ -441,15 +444,40 @@ function New-AudioMixerChannelStrip {
     $fader.Value = [int][Math]::Round($gainDb)
     $fader.TickFrequency = 6
     $fader.TickStyle = [System.Windows.Forms.TickStyle]::Both
-    $fader.Dock = 'Fill'
-    $layout.Controls.Add($fader, 0, 5)
+    $fader.AutoSize = $false
+
+    $zeroDbLabel = New-Object System.Windows.Forms.Label
+    $zeroDbLabel.Text = '0 dB'
+    $zeroDbLabel.AutoSize = $true
+    $zeroDbLabel.ForeColor = [System.Drawing.Color]::FromArgb(203, 213, 225)
+    $zeroDbLabel.BackColor = $panel.BackColor
+
+    $faderHost.Controls.Add($fader)
+    $faderHost.Controls.Add($zeroDbLabel)
+    $layout.Controls.Add($faderHost, 0, 4)
+
+    $positionFader = {
+        $faderWidth = 70
+        $faderLeft = [Math]::Max(0, [int](($faderHost.ClientSize.Width - $faderWidth) / 2))
+        $fader.SetBounds($faderLeft, 0, $faderWidth, $faderHost.ClientSize.Height)
+
+        $trackPadding = 13
+        $trackHeight = [Math]::Max(0, $fader.Height - (2 * $trackPadding))
+        $zeroFraction = [double]($fader.Maximum - 0) / [double]($fader.Maximum - $fader.Minimum)
+        $zeroTop = $trackPadding + [int][Math]::Round($trackHeight * $zeroFraction) - [int]($zeroDbLabel.Height / 2)
+        $zeroLeft = $faderLeft + $faderWidth - 4
+        $zeroDbLabel.Location = New-Object System.Drawing.Point($zeroLeft, [Math]::Max(0, $zeroTop))
+        $zeroDbLabel.BringToFront()
+    }.GetNewClosure()
+    $faderHost.Add_Resize($positionFader)
+    & $positionFader
 
     $gainLabel = New-Object System.Windows.Forms.Label
     $gainLabel.Text = ('{0:+0;-0;0} dB' -f $gainDb)
     $gainLabel.Dock = 'Fill'
     $gainLabel.ForeColor = [System.Drawing.Color]::FromArgb(226, 232, 240)
     $gainLabel.TextAlign = 'MiddleCenter'
-    $layout.Controls.Add($gainLabel, 0, 6)
+    $layout.Controls.Add($gainLabel, 0, 5)
 
     $switches = New-Object System.Windows.Forms.TableLayoutPanel
     $switches.Dock = 'Fill'
@@ -472,7 +500,7 @@ function New-AudioMixerChannelStrip {
     $soloControl.FlatStyle = 'Flat'
     $switches.Controls.Add($muteControl, 0, 0)
     $switches.Controls.Add($soloControl, 1, 0)
-    $layout.Controls.Add($switches, 0, 7)
+    $layout.Controls.Add($switches, 0, 6)
 
     $identity = New-Object System.Windows.Forms.Label
     $identity.Text = ConvertTo-PlainString $Device.EndpointGuid
@@ -480,14 +508,14 @@ function New-AudioMixerChannelStrip {
     $identity.AutoEllipsis = $true
     $identity.ForeColor = [System.Drawing.Color]::FromArgb(100, 116, 139)
     $identity.TextAlign = 'MiddleCenter'
-    $layout.Controls.Add($identity, 0, 8)
+    $layout.Controls.Add($identity, 0, 7)
 
     $status = New-Object System.Windows.Forms.Label
     $status.Text = 'READY'
     $status.Dock = 'Fill'
     $status.ForeColor = [System.Drawing.Color]::FromArgb(74, 222, 128)
     $status.TextAlign = 'MiddleCenter'
-    $layout.Controls.Add($status, 0, 9)
+    $layout.Controls.Add($status, 0, 8)
 
     $state.Panel = $panel
     $state.Meter = $meter
