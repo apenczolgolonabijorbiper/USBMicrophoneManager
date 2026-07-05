@@ -5,6 +5,31 @@ Multi-device AudioGraph mixer routed to a VB-Audio Virtual Cable render endpoint
 Set-StrictMode -Version 2.0
 
 $script:AudioMixerWindow = $null
+$script:AudioMixerInputsChangedHandler = $null
+
+function Set-AudioMixerInputsRefreshPending {
+    <# Marks the open live mixer as needing an input reconciliation after the main inventory changes. #>
+    if ($script:AudioMixerInputsChangedHandler) {
+        & $script:AudioMixerInputsChangedHandler
+    }
+}
+
+function Get-AudioMixerDeviceSignature {
+    <# Builds a stable signature for active devices currently assigned to the mixer. #>
+    param([AllowEmptyCollection()][object[]]$Devices)
+
+    $parts = @()
+    foreach ($device in @($Devices)) {
+        if (-not [bool](Get-ObjectPropertyValue -Object $device -Name 'IsMicrophone' -Default $false)) { continue }
+        if (-not (Test-DeviceRecordIsActive -Device $device)) { continue }
+        $endpointGuid = Normalize-DeviceId (ConvertTo-PlainString $device.EndpointGuid)
+        if ([string]::IsNullOrWhiteSpace($endpointGuid)) { continue }
+        $parts += '{0}|{1}|{2}' -f (
+            Normalize-DeviceId (ConvertTo-PlainString $device.InstanceId)
+        ), $endpointGuid, (ConvertTo-PlainString $device.Status)
+    }
+    return (($parts | Sort-Object) -join ';')
+}
 
 function Initialize-AudioGraphRuntime {
     <# Loads Windows Runtime assemblies and audio types required by AudioGraph. #>
@@ -120,6 +145,7 @@ function Read-AudioMixerConfig {
 
     $config = @{
         MasterDb = 0.0
+        LatencyMode = 'LowestLatency'
         Channels = @{}
     }
     $path = Get-AudioMixerConfigPath -ProjectRoot $ProjectRoot
@@ -129,6 +155,11 @@ function Read-AudioMixerConfig {
         if ([string]::IsNullOrWhiteSpace($raw)) { return $config }
         $json = $raw | ConvertFrom-Json
         $config.MasterDb = [double](Get-ObjectPropertyValue -Object $json -Name 'MasterDb' -Default 0)
+        $latencyMode = ConvertTo-PlainString (Get-ObjectPropertyValue -Object $json -Name 'LatencyMode' -Default 'LowestLatency')
+        if ($latencyMode -notin @('SystemDefault', 'LowestLatency')) {
+            $latencyMode = 'LowestLatency'
+        }
+        $config.LatencyMode = $latencyMode
         $channels = Get-ObjectPropertyValue -Object $json -Name 'Channels' -Default $null
         if ($channels) {
             foreach ($property in $channels.PSObject.Properties) {
@@ -137,6 +168,7 @@ function Read-AudioMixerConfig {
                     Enabled = ConvertTo-StorageBoolean -Value (Get-ObjectPropertyValue -Object $property.Value -Name 'Enabled' -Default $true) -Default $true
                     GainDb = [double](Get-ObjectPropertyValue -Object $property.Value -Name 'GainDb' -Default 0)
                     Mute = ConvertTo-StorageBoolean -Value (Get-ObjectPropertyValue -Object $property.Value -Name 'Mute' -Default $false) -Default $false
+                    Priority = ConvertTo-StorageBoolean -Value (Get-ObjectPropertyValue -Object $property.Value -Name 'Priority' -Default $false) -Default $false
                     Solo = ConvertTo-StorageBoolean -Value (Get-ObjectPropertyValue -Object $property.Value -Name 'Solo' -Default $false) -Default $false
                 }
             }
@@ -154,11 +186,23 @@ function Save-AudioMixerConfig {
         [Parameter(Mandatory=$true)][string]$ProjectRoot,
         [Parameter(Mandatory=$true)][AllowEmptyCollection()][object[]]$Channels,
         [double]$MasterDb,
+        [ValidateSet('SystemDefault','LowestLatency')][string]$LatencyMode = 'LowestLatency',
         [scriptblock]$Logger
     )
 
     $path = Get-AudioMixerConfigPath -ProjectRoot $ProjectRoot
     $channelRoot = [ordered]@{}
+    $existingConfig = Read-AudioMixerConfig -ProjectRoot $ProjectRoot -Logger $Logger
+    foreach ($key in @($existingConfig.Channels.Keys)) {
+        $saved = $existingConfig.Channels[$key]
+        $channelRoot[$key] = [ordered]@{
+            Enabled = [bool]$saved.Enabled
+            GainDb = [double]$saved.GainDb
+            Mute = [bool]$saved.Mute
+            Priority = [bool]$saved.Priority
+            Solo = [bool]$saved.Solo
+        }
+    }
     foreach ($channel in $Channels) {
         $key = Normalize-DeviceId (ConvertTo-PlainString $channel.Device.InstanceId)
         if ([string]::IsNullOrWhiteSpace($key)) { continue }
@@ -166,11 +210,13 @@ function Save-AudioMixerConfig {
             Enabled = [bool]$channel.Enabled
             GainDb = [double]$channel.GainDb
             Mute = [bool]$channel.Mute
+            Priority = [bool]$channel.Priority
             Solo = [bool]$channel.Solo
         }
     }
     $root = [ordered]@{
         MasterDb = [double]$MasterDb
+        LatencyMode = $LatencyMode
         Channels = $channelRoot
     }
 
@@ -223,6 +269,12 @@ function Update-AudioGraphMixerGains {
     )
 
     $hasSolo = @($ChannelStates | Where-Object { $_.Enabled -and $_.Solo }).Count -gt 0
+    $hasPriority = @($ChannelStates | Where-Object {
+        $_.Enabled -and
+        $_.Priority -and
+        -not $_.Mute -and
+        (-not $hasSolo -or $_.Solo)
+    }).Count -gt 0
     foreach ($runtimeChannel in @($Runtime.Channels)) {
         $state = $ChannelStates | Where-Object {
             (Normalize-DeviceId $_.Device.InstanceId) -eq $runtimeChannel.Key
@@ -235,13 +287,95 @@ function Update-AudioGraphMixerGains {
         $audible = [bool]$state.Enabled -and -not [bool]$state.Mute
         if ($hasSolo -and -not [bool]$state.Solo) { $audible = $false }
         $runtimeChannel.Node.OutgoingGain = if ($audible) {
-            Convert-DecibelsToLinearGain -Decibels ([double]$state.GainDb)
+            $effectiveGainDb = [double]$state.GainDb
+            if ($hasPriority -and -not [bool]$state.Priority) {
+                $effectiveGainDb -= 20.0
+            }
+            Convert-DecibelsToLinearGain -Decibels $effectiveGainDb
         }
         else {
             0.0
         }
     }
     $Runtime.MixNode.OutgoingGain = Convert-DecibelsToLinearGain -Decibels $MasterDb
+}
+
+function Get-AudioGraphCaptureDeviceMap {
+    <# Maps capture endpoint GUIDs to WinRT DeviceInformation records. #>
+    $captureByGuid = @{}
+    foreach ($captureDevice in @(Get-AudioGraphDeviceInformation -Flow Capture)) {
+        $guid = Normalize-DeviceId (Get-AudioGraphEndpointGuid -DeviceInformationId $captureDevice.Id)
+        if (-not [string]::IsNullOrWhiteSpace($guid)) {
+            $captureByGuid[$guid] = $captureDevice
+        }
+    }
+    return $captureByGuid
+}
+
+function Add-AudioGraphMixerInput {
+    <# Adds one microphone input node to an existing AudioGraph, including a graph that is already running. #>
+    param(
+        [Parameter(Mandatory=$true)][object]$Runtime,
+        [Parameter(Mandatory=$true)][object]$Device,
+        [Parameter(Mandatory=$true)][hashtable]$CaptureByGuid,
+        [scriptblock]$Logger
+    )
+
+    $key = Normalize-DeviceId (ConvertTo-PlainString $Device.InstanceId)
+    if (@($Runtime.Channels | Where-Object { $_.Key -eq $key }).Count -gt 0) { return $true }
+
+    $endpointGuid = Normalize-DeviceId (ConvertTo-PlainString $Device.EndpointGuid)
+    if ([string]::IsNullOrWhiteSpace($endpointGuid) -or -not $CaptureByGuid.ContainsKey($endpointGuid)) {
+        Write-AppLog -Message ("Mixer skipped endpoint not available to AudioGraph: {0}" -f $Device.FriendlyName) -Level WARN -Logger $Logger
+        return $false
+    }
+
+    $inputResultType = [Windows.Media.Audio.CreateAudioDeviceInputNodeResult,Windows.Media.Audio,ContentType=WindowsRuntime]
+    $encoding = $null
+    $operation = $Runtime.Graph.CreateDeviceInputNodeAsync(
+        [Windows.Media.Capture.MediaCategory]::Other,
+        $encoding,
+        $CaptureByGuid[$endpointGuid]
+    )
+    $inputResult = Get-WinRtAsyncResult -Operation $operation -ResultType $inputResultType
+    if ($inputResult.Status.ToString() -ne 'Success' -or $null -eq $inputResult.DeviceInputNode) {
+        Write-AppLog -Message ("Mixer input failed for {0}: {1}" -f $Device.FriendlyName, $inputResult.Status) -Level ERROR -Logger $Logger
+        return $false
+    }
+
+    $inputResult.DeviceInputNode.OutgoingGain = 0.0
+    $inputResult.DeviceInputNode.AddOutgoingConnection($Runtime.MixNode)
+    $Runtime.Channels += [pscustomobject]@{
+        Key = $key
+        Device = $Device
+        Node = $inputResult.DeviceInputNode
+    }
+    Write-AppLog -Message ("Mixer input joined live: {0}." -f $Device.FriendlyName) -Level DEVICE -Logger $Logger
+    return $true
+}
+
+function Remove-AudioGraphMixerInput {
+    <# Disconnects and releases one microphone input node without stopping the AudioGraph. #>
+    param(
+        [Parameter(Mandatory=$true)][object]$Runtime,
+        [Parameter(Mandatory=$true)][string]$Key,
+        [scriptblock]$Logger
+    )
+
+    $normalizedKey = Normalize-DeviceId $Key
+    $runtimeChannel = $Runtime.Channels | Where-Object { $_.Key -eq $normalizedKey } | Select-Object -First 1
+    if ($null -eq $runtimeChannel) { return }
+
+    try {
+        $runtimeChannel.Node.OutgoingGain = 0.0
+        $runtimeChannel.Node.RemoveOutgoingConnection($Runtime.MixNode)
+    }
+    catch {
+        Write-AppLog -Message ("Disconnecting mixer input failed: {0}" -f $_.Exception.Message) -Level WARN -Logger $Logger
+    }
+    try { Close-WinRtAudioObject -Object $runtimeChannel.Node } catch { }
+    $Runtime.Channels = @($Runtime.Channels | Where-Object { $_.Key -ne $normalizedKey })
+    Write-AppLog -Message ("Mixer input left live: {0}." -f $runtimeChannel.Device.FriendlyName) -Level DEVICE -Logger $Logger
 }
 
 function Start-AudioGraphMixer {
@@ -251,6 +385,7 @@ function Start-AudioGraphMixer {
         [Parameter(Mandatory=$true)][object]$OutputEndpoint,
         [Parameter(Mandatory=$true)][AllowEmptyCollection()][object[]]$ChannelStates,
         [double]$MasterDb,
+        [ValidateSet('SystemDefault','LowestLatency')][string]$LatencyMode = 'LowestLatency',
         [scriptblock]$Logger
     )
 
@@ -259,7 +394,12 @@ function Start-AudioGraphMixer {
     try {
         $settings = New-Object Windows.Media.Audio.AudioGraphSettings ([Windows.Media.Render.AudioRenderCategory]::Media)
         $settings.PrimaryRenderDevice = $OutputEndpoint.DeviceInformation
-        $settings.QuantumSizeSelectionMode = [Windows.Media.Audio.QuantumSizeSelectionMode]::LowestLatency
+        $settings.QuantumSizeSelectionMode = if ($LatencyMode -eq 'SystemDefault') {
+            [Windows.Media.Audio.QuantumSizeSelectionMode]::SystemDefault
+        }
+        else {
+            [Windows.Media.Audio.QuantumSizeSelectionMode]::LowestLatency
+        }
 
         $graphResultType = [Windows.Media.Audio.CreateAudioGraphResult,Windows.Media.Audio,ContentType=WindowsRuntime]
         $graphResult = Get-WinRtAsyncResult -Operation ([Windows.Media.Audio.AudioGraph]::CreateAsync($settings)) -ResultType $graphResultType
@@ -284,46 +424,15 @@ function Start-AudioGraphMixer {
         $runtime.MixNode = $runtime.Graph.CreateSubmixNode()
         $runtime.MixNode.AddOutgoingConnection($runtime.OutputNode)
 
-        $captureByGuid = @{}
-        foreach ($captureDevice in @(Get-AudioGraphDeviceInformation -Flow Capture)) {
-            $guid = Normalize-DeviceId (Get-AudioGraphEndpointGuid -DeviceInformationId $captureDevice.Id)
-            if (-not [string]::IsNullOrWhiteSpace($guid)) {
-                $captureByGuid[$guid] = $captureDevice
-            }
-        }
-
-        $inputResultType = [Windows.Media.Audio.CreateAudioDeviceInputNodeResult,Windows.Media.Audio,ContentType=WindowsRuntime]
+        $captureByGuid = Get-AudioGraphCaptureDeviceMap
         foreach ($device in $Devices) {
-            $endpointGuid = Normalize-DeviceId (ConvertTo-PlainString $device.EndpointGuid)
-            if ([string]::IsNullOrWhiteSpace($endpointGuid) -or -not $captureByGuid.ContainsKey($endpointGuid)) {
-                Write-AppLog -Message ("Mixer skipped endpoint not available to AudioGraph: {0}" -f $device.FriendlyName) -Level WARN -Logger $Logger
-                continue
-            }
-
-            $encoding = $null
-            $operation = $runtime.Graph.CreateDeviceInputNodeAsync(
-                [Windows.Media.Capture.MediaCategory]::Other,
-                $encoding,
-                $captureByGuid[$endpointGuid]
-            )
-            $inputResult = Get-WinRtAsyncResult -Operation $operation -ResultType $inputResultType
-            if ($inputResult.Status.ToString() -ne 'Success' -or $null -eq $inputResult.DeviceInputNode) {
-                Write-AppLog -Message ("Mixer input failed for {0}: {1}" -f $device.FriendlyName, $inputResult.Status) -Level ERROR -Logger $Logger
-                continue
-            }
-
-            $inputResult.DeviceInputNode.AddOutgoingConnection($runtime.MixNode)
-            $runtime.Channels += [pscustomobject]@{
-                Key = Normalize-DeviceId (ConvertTo-PlainString $device.InstanceId)
-                Device = $device
-                Node = $inputResult.DeviceInputNode
-            }
+            [void](Add-AudioGraphMixerInput -Runtime $runtime -Device $device -CaptureByGuid $captureByGuid -Logger $Logger)
         }
 
         if ($runtime.Channels.Count -eq 0) { throw 'No selected microphone could be opened by AudioGraph.' }
         Update-AudioGraphMixerGains -Runtime $runtime -ChannelStates $ChannelStates -MasterDb $MasterDb
         $runtime.Graph.Start()
-        Write-AppLog -Message ("Mixer started: {0} input(s) -> {1}." -f $runtime.Channels.Count, $OutputEndpoint.Name) -Level INFO -Logger $Logger
+        Write-AppLog -Message ("Mixer started: {0} input(s) -> {1}; latency mode: {2}." -f $runtime.Channels.Count, $OutputEndpoint.Name, $LatencyMode) -Level INFO -Logger $Logger
         return $runtime
     }
     catch {
@@ -333,21 +442,23 @@ function Start-AudioGraphMixer {
 }
 
 function New-AudioMixerChannelStrip {
-    <# Builds one channel strip with aliases, meter, fader, enable, mute, and solo controls. #>
+    <# Builds one channel strip with aliases, mute, priority, solo, meter, and fader controls. #>
     param(
         [Parameter(Mandatory=$true)][object]$Device,
         [hashtable]$SavedSettings,
-        [Parameter(Mandatory=$true)][scriptblock]$OnChanged
+        [Parameter(Mandatory=$true)][scriptblock]$OnChanged,
+        [Parameter(Mandatory=$true)][scriptblock]$OnPriority,
+        [Parameter(Mandatory=$true)][scriptblock]$OnSolo
     )
 
-    $enabled = $true
     $gainDb = -12.0
     $mute = $false
+    $priority = $false
     $solo = $false
     if ($SavedSettings) {
-        $enabled = [bool]$SavedSettings.Enabled
         $gainDb = [double]$SavedSettings.GainDb
         $mute = [bool]$SavedSettings.Mute
+        $priority = [bool]$SavedSettings.Priority
         $solo = [bool]$SavedSettings.Solo
     }
     if ($gainDb -lt -60) { $gainDb = -60 }
@@ -355,16 +466,18 @@ function New-AudioMixerChannelStrip {
 
     $state = [pscustomobject]@{
         Device = $Device
-        Enabled = $enabled
+        Enabled = $true
         GainDb = $gainDb
         Mute = $mute
+        Priority = $priority
         Solo = $solo
         Panel = $null
         Meter = $null
         GainLabel = $null
-        EnableControl = $null
         MuteControl = $null
+        PriorityControl = $null
         SoloControl = $null
+        UpdateSwitchColors = $null
     }
 
     $panel = New-Object System.Windows.Forms.Panel
@@ -376,16 +489,13 @@ function New-AudioMixerChannelStrip {
     $layout = New-Object System.Windows.Forms.TableLayoutPanel
     $layout.Dock = 'Fill'
     $layout.ColumnCount = 1
-    $layout.RowCount = 9
+    $layout.RowCount = 6
     [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 34)))
     [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 42)))
-    [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 30)))
+    [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 38)))
     [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 26)))
     [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Percent', 100)))
     [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 28)))
-    [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 38)))
-    [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 26)))
-    [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 22)))
     $panel.Controls.Add($layout)
 
     $alias2 = ConvertTo-PlainString $Device.Alias2
@@ -417,14 +527,35 @@ function New-AudioMixerChannelStrip {
     $deviceLabel.TextAlign = 'MiddleCenter'
     $layout.Controls.Add($deviceLabel, 0, 1)
 
-    $enableControl = New-Object System.Windows.Forms.CheckBox
-    $enableControl.Text = 'IN MIX'
-    $enableControl.Checked = $enabled
-    $enableControl.Dock = 'Fill'
-    $enableControl.TextAlign = 'MiddleCenter'
-    $enableControl.CheckAlign = 'MiddleLeft'
-    $enableControl.ForeColor = [System.Drawing.Color]::FromArgb(226, 232, 240)
-    $layout.Controls.Add($enableControl, 0, 2)
+    $switches = New-Object System.Windows.Forms.TableLayoutPanel
+    $switches.Dock = 'Fill'
+    $switches.Margin = New-Object System.Windows.Forms.Padding(0)
+    $switches.Padding = New-Object System.Windows.Forms.Padding(0)
+    $switches.ColumnCount = 3
+    $switches.RowCount = 1
+    [void]$switches.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 33.333)))
+    [void]$switches.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 33.334)))
+    [void]$switches.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 33.333)))
+    [void]$switches.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Percent', 100)))
+    $muteControl = New-Object System.Windows.Forms.Button
+    $muteControl.Text = 'MUTE'
+    $muteControl.Dock = 'Fill'
+    $muteControl.Margin = New-Object System.Windows.Forms.Padding(0, 2, 2, 2)
+    $muteControl.FlatStyle = 'Flat'
+    $priorityControl = New-Object System.Windows.Forms.Button
+    $priorityControl.Text = 'PRIO'
+    $priorityControl.Dock = 'Fill'
+    $priorityControl.Margin = New-Object System.Windows.Forms.Padding(2, 2, 2, 2)
+    $priorityControl.FlatStyle = 'Flat'
+    $soloControl = New-Object System.Windows.Forms.Button
+    $soloControl.Text = 'SOLO'
+    $soloControl.Dock = 'Fill'
+    $soloControl.Margin = New-Object System.Windows.Forms.Padding(2, 2, 0, 2)
+    $soloControl.FlatStyle = 'Flat'
+    $switches.Controls.Add($muteControl, 0, 0)
+    $switches.Controls.Add($priorityControl, 1, 0)
+    $switches.Controls.Add($soloControl, 2, 0)
+    $layout.Controls.Add($switches, 0, 2)
 
     $meter = New-Object System.Windows.Forms.ProgressBar
     $meter.Dock = 'Fill'
@@ -479,63 +610,24 @@ function New-AudioMixerChannelStrip {
     $gainLabel.TextAlign = 'MiddleCenter'
     $layout.Controls.Add($gainLabel, 0, 5)
 
-    $switches = New-Object System.Windows.Forms.TableLayoutPanel
-    $switches.Dock = 'Fill'
-    $switches.Margin = New-Object System.Windows.Forms.Padding(0)
-    $switches.Padding = New-Object System.Windows.Forms.Padding(0)
-    $switches.ColumnCount = 2
-    $switches.RowCount = 1
-    [void]$switches.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 50)))
-    [void]$switches.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 50)))
-    [void]$switches.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Percent', 100)))
-    $muteControl = New-Object System.Windows.Forms.Button
-    $muteControl.Text = 'MUTE'
-    $muteControl.Dock = 'Fill'
-    $muteControl.Margin = New-Object System.Windows.Forms.Padding(0, 2, 3, 2)
-    $muteControl.FlatStyle = 'Flat'
-    $soloControl = New-Object System.Windows.Forms.Button
-    $soloControl.Text = 'SOLO'
-    $soloControl.Dock = 'Fill'
-    $soloControl.Margin = New-Object System.Windows.Forms.Padding(3, 2, 0, 2)
-    $soloControl.FlatStyle = 'Flat'
-    $switches.Controls.Add($muteControl, 0, 0)
-    $switches.Controls.Add($soloControl, 1, 0)
-    $layout.Controls.Add($switches, 0, 6)
-
-    $identity = New-Object System.Windows.Forms.Label
-    $identity.Text = ConvertTo-PlainString $Device.EndpointGuid
-    $identity.Dock = 'Fill'
-    $identity.AutoEllipsis = $true
-    $identity.ForeColor = [System.Drawing.Color]::FromArgb(100, 116, 139)
-    $identity.TextAlign = 'MiddleCenter'
-    $layout.Controls.Add($identity, 0, 7)
-
-    $status = New-Object System.Windows.Forms.Label
-    $status.Text = 'READY'
-    $status.Dock = 'Fill'
-    $status.ForeColor = [System.Drawing.Color]::FromArgb(74, 222, 128)
-    $status.TextAlign = 'MiddleCenter'
-    $layout.Controls.Add($status, 0, 8)
-
     $state.Panel = $panel
     $state.Meter = $meter
     $state.GainLabel = $gainLabel
-    $state.EnableControl = $enableControl
     $state.MuteControl = $muteControl
+    $state.PriorityControl = $priorityControl
     $state.SoloControl = $soloControl
 
     $updateSwitchColors = {
         $muteControl.BackColor = if ($state.Mute) { [System.Drawing.Color]::FromArgb(220, 38, 38) } else { [System.Drawing.Color]::FromArgb(51, 65, 85) }
         $muteControl.ForeColor = [System.Drawing.Color]::White
+        $priorityControl.BackColor = if ($state.Priority) { [System.Drawing.Color]::FromArgb(37, 99, 235) } else { [System.Drawing.Color]::FromArgb(51, 65, 85) }
+        $priorityControl.ForeColor = [System.Drawing.Color]::White
         $soloControl.BackColor = if ($state.Solo) { [System.Drawing.Color]::FromArgb(234, 179, 8) } else { [System.Drawing.Color]::FromArgb(51, 65, 85) }
         $soloControl.ForeColor = [System.Drawing.Color]::White
     }.GetNewClosure()
+    $state.UpdateSwitchColors = $updateSwitchColors
     & $updateSwitchColors
 
-    $enableControl.Add_CheckedChanged({
-        $state.Enabled = $enableControl.Checked
-        & $OnChanged
-    }.GetNewClosure())
     $fader.Add_Scroll({
         $state.GainDb = [double]$fader.Value
         $gainLabel.Text = ('{0:+0;-0;0} dB' -f $state.GainDb)
@@ -546,10 +638,11 @@ function New-AudioMixerChannelStrip {
         & $updateSwitchColors
         & $OnChanged
     }.GetNewClosure())
+    $priorityControl.Add_Click({
+        & $OnPriority $state
+    }.GetNewClosure())
     $soloControl.Add_Click({
-        $state.Solo = -not $state.Solo
-        & $updateSwitchColors
-        & $OnChanged
+        & $OnSolo $state
     }.GetNewClosure())
 
     return $state
@@ -585,9 +678,9 @@ function Show-AudioMixerWindow {
     $root.ColumnCount = 1
     $root.Padding = New-Object System.Windows.Forms.Padding(12)
     [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 58)))
-    [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 66)))
+    [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 58)))
+    [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 52)))
     [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Percent', 100)))
-    [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 34)))
     $form.Controls.Add($root)
 
     $header = New-Object System.Windows.Forms.Panel
@@ -621,35 +714,74 @@ function Show-AudioMixerWindow {
     $cmbOutput.DropDownStyle = 'DropDownList'
     $cmbOutput.Width = 290
     $cmbOutput.DisplayMember = 'Name'
-    $cmbOutput.Margin = New-Object System.Windows.Forms.Padding(0, 5, 12, 0)
-    $btnStart = New-ToolbarButton -Text 'Start Mix' -Icon 'ON'
-    $btnStop = New-ToolbarButton -Text 'Stop' -Icon 'OFF'
-    $btnStop.Enabled = $false
+    $cmbOutput.Margin = New-Object System.Windows.Forms.Padding(0, 5, 10, 0)
+    $latencyLabel = New-Object System.Windows.Forms.Label
+    $latencyLabel.Text = 'LATENCY'
+    $latencyLabel.AutoSize = $true
+    $latencyLabel.Margin = New-Object System.Windows.Forms.Padding(0, 10, 8, 0)
+    $latencyLabel.ForeColor = [System.Drawing.Color]::FromArgb(148, 163, 184)
+    $cmbLatency = New-Object System.Windows.Forms.ComboBox
+    $cmbLatency.DropDownStyle = 'DropDownList'
+    $cmbLatency.Width = 170
+    $cmbLatency.DisplayMember = 'Name'
+    $cmbLatency.Margin = New-Object System.Windows.Forms.Padding(0, 5, 12, 0)
+    [void]$cmbLatency.Items.Add([pscustomobject]@{
+        Name = 'Stable (system default)'
+        Mode = 'SystemDefault'
+    })
+    [void]$cmbLatency.Items.Add([pscustomobject]@{
+        Name = 'Lowest latency'
+        Mode = 'LowestLatency'
+    })
+    $btnMix = New-Object System.Windows.Forms.Button
+    $btnMix.Text = 'Start Mix'
+    $btnMix.AutoSize = $true
+    $btnMix.Height = 34
+    $btnMix.Margin = New-Object System.Windows.Forms.Padding(4)
+    $btnMix.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $btnMix.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(74, 222, 128)
+    $btnMix.BackColor = [System.Drawing.Color]::FromArgb(22, 163, 74)
+    $btnMix.ForeColor = [System.Drawing.Color]::White
     $btnRefresh = New-ToolbarButton -Text 'Refresh Inputs' -Icon 'R'
+    $refreshButtonNormalColor = $btnRefresh.BackColor
+    foreach ($control in @($outputLabel,$cmbOutput,$latencyLabel,$cmbLatency,$btnMix,$btnRefresh)) {
+        [void]$toolbar.Controls.Add($control)
+    }
+    $root.Controls.Add($toolbar, 0, 1)
+
+    $masterToolbar = New-Object System.Windows.Forms.FlowLayoutPanel
+    $masterToolbar.Dock = 'Fill'
+    $masterToolbar.WrapContents = $false
+    $masterToolbar.Padding = New-Object System.Windows.Forms.Padding(0, 4, 0, 4)
     $masterLabel = New-Object System.Windows.Forms.Label
-    $masterLabel.Text = 'MASTER'
+    $masterLabel.Text = 'MASTER GAIN'
     $masterLabel.AutoSize = $true
-    $masterLabel.Margin = New-Object System.Windows.Forms.Padding(16, 10, 4, 0)
+    $masterLabel.Margin = New-Object System.Windows.Forms.Padding(0, 10, 8, 0)
     $masterFader = New-Object System.Windows.Forms.TrackBar
     $masterFader.Minimum = -24
     $masterFader.Maximum = 6
     $masterFader.TickFrequency = 3
-    $masterFader.Width = 160
+    $masterFader.Width = 260
     $masterFader.Margin = New-Object System.Windows.Forms.Padding(0, 0, 4, 0)
     $masterValue = New-Object System.Windows.Forms.Label
     $masterValue.AutoSize = $true
-    $masterValue.Margin = New-Object System.Windows.Forms.Padding(0, 10, 0, 0)
+    $masterValue.Margin = New-Object System.Windows.Forms.Padding(0, 10, 18, 0)
+    $masterMeterLabel = New-Object System.Windows.Forms.Label
+    $masterMeterLabel.Text = 'MASTER LEVEL'
+    $masterMeterLabel.AutoSize = $true
+    $masterMeterLabel.Margin = New-Object System.Windows.Forms.Padding(0, 10, 8, 0)
+    $masterMeterLabel.ForeColor = [System.Drawing.Color]::FromArgb(148, 163, 184)
     $masterMeter = New-Object System.Windows.Forms.ProgressBar
     $masterMeter.Minimum = 0
     $masterMeter.Maximum = 100
-    $masterMeter.Width = 110
+    $masterMeter.Width = 260
     $masterMeter.Height = 20
     $masterMeter.Style = [System.Windows.Forms.ProgressBarStyle]::Continuous
-    $masterMeter.Margin = New-Object System.Windows.Forms.Padding(10, 9, 0, 0)
-    foreach ($control in @($outputLabel,$cmbOutput,$btnStart,$btnStop,$btnRefresh,$masterLabel,$masterFader,$masterValue,$masterMeter)) {
-        [void]$toolbar.Controls.Add($control)
+    $masterMeter.Margin = New-Object System.Windows.Forms.Padding(0, 8, 0, 0)
+    foreach ($control in @($masterLabel,$masterFader,$masterValue,$masterMeterLabel,$masterMeter)) {
+        [void]$masterToolbar.Controls.Add($control)
     }
-    $root.Controls.Add($toolbar, 0, 1)
+    $root.Controls.Add($masterToolbar, 0, 2)
 
     $channelHost = New-Object System.Windows.Forms.FlowLayoutPanel
     $channelHost.Dock = 'Fill'
@@ -658,13 +790,7 @@ function Show-AudioMixerWindow {
     $channelHost.AutoScroll = $true
     $channelHost.Padding = New-Object System.Windows.Forms.Padding(4)
     $channelHost.BackColor = [System.Drawing.Color]::FromArgb(17, 24, 39)
-    $root.Controls.Add($channelHost, 0, 2)
-
-    $statusLabel = New-Object System.Windows.Forms.Label
-    $statusLabel.Dock = 'Fill'
-    $statusLabel.TextAlign = 'MiddleLeft'
-    $statusLabel.ForeColor = [System.Drawing.Color]::FromArgb(148, 163, 184)
-    $root.Controls.Add($statusLabel, 0, 3)
+    $root.Controls.Add($channelHost, 0, 3)
 
     $config = Read-AudioMixerConfig -ProjectRoot $ProjectRoot -Logger $Logger
     $masterDb = [double]$config.MasterDb
@@ -672,11 +798,30 @@ function Show-AudioMixerWindow {
     if ($masterDb -gt 6) { $masterDb = 6 }
     $masterFader.Value = [int][Math]::Round($masterDb)
     $masterValue.Text = ('{0:+0;-0;0} dB' -f $masterDb)
+    $cmbLatency.SelectedIndex = if ($config.LatencyMode -eq 'SystemDefault') { 0 } else { 1 }
 
     $mixerState = @{
         Runtime = $null
         Channels = @()
     }
+    $script:AudioMixerInputsChangedHandler = {
+        if ($mixerState.Runtime -and -not $btnRefresh.IsDisposed) {
+            $btnRefresh.BackColor = [System.Drawing.Color]::FromArgb(250, 204, 21)
+            $btnRefresh.ForeColor = [System.Drawing.Color]::FromArgb(66, 32, 6)
+        }
+    }.GetNewClosure()
+    $mixBlinkState = $false
+    $mixBlinkTimer = New-Object System.Windows.Forms.Timer
+    $mixBlinkTimer.Interval = 500
+    $mixBlinkTimer.Add_Tick({
+        $mixBlinkState = -not $mixBlinkState
+        $btnMix.BackColor = if ($mixBlinkState) {
+            [System.Drawing.Color]::FromArgb(220, 38, 38)
+        }
+        else {
+            [System.Drawing.Color]::FromArgb(22, 163, 74)
+        }
+    }.GetNewClosure())
 
     $applyMix = {
         if ($mixerState.Runtime) {
@@ -684,14 +829,46 @@ function Show-AudioMixerWindow {
         }
     }.GetNewClosure()
 
+    $setPriority = {
+        param([Parameter(Mandatory=$true)][object]$TargetState)
+
+        $enablePriority = -not [bool]$TargetState.Priority
+        $targetKey = Normalize-DeviceId (ConvertTo-PlainString $TargetState.Device.InstanceId)
+        foreach ($channel in $mixerState.Channels) {
+            $channelKey = Normalize-DeviceId (ConvertTo-PlainString $channel.Device.InstanceId)
+            $channel.Priority = $enablePriority -and ($channelKey -eq $targetKey)
+            $refreshColors = $channel.UpdateSwitchColors
+            & $refreshColors
+        }
+        & $applyMix
+    }.GetNewClosure()
+
+    $setSolo = {
+        param([Parameter(Mandatory=$true)][object]$TargetState)
+
+        $enableSolo = -not [bool]$TargetState.Solo
+        $targetKey = Normalize-DeviceId (ConvertTo-PlainString $TargetState.Device.InstanceId)
+        foreach ($channel in $mixerState.Channels) {
+            $channelKey = Normalize-DeviceId (ConvertTo-PlainString $channel.Device.InstanceId)
+            $channel.Solo = $enableSolo -and ($channelKey -eq $targetKey)
+            $refreshColors = $channel.UpdateSwitchColors
+            & $refreshColors
+        }
+        & $applyMix
+    }.GetNewClosure()
+
     $stopMix = {
         if ($mixerState.Runtime) {
             Stop-AudioGraphMixer -Runtime $mixerState.Runtime -Logger $Logger
             $mixerState.Runtime = $null
-            $btnStart.Enabled = $true
-            $btnStop.Enabled = $false
+            $mixBlinkTimer.Stop()
+            $mixBlinkState = $false
+            $btnMix.Text = 'Start Mix'
+            $btnMix.BackColor = [System.Drawing.Color]::FromArgb(22, 163, 74)
             $cmbOutput.Enabled = $true
-            $statusLabel.Text = 'Mix stopped. CABLE Output is no longer receiving MicMaster audio.'
+            $cmbLatency.Enabled = $true
+            $btnRefresh.BackColor = $refreshButtonNormalColor
+            $btnRefresh.ForeColor = [System.Drawing.Color]::FromArgb(22, 32, 45)
             Write-AppLog -Message 'Mixer stopped.' -Level INFO -Logger $Logger
         }
     }.GetNewClosure()
@@ -712,46 +889,127 @@ function Show-AudioMixerWindow {
     }.GetNewClosure()
 
     $loadChannels = {
-        & $stopMix
+        param([bool]$RefreshInventory = $false)
+
+        $currentSettings = @{}
+        foreach ($channel in $mixerState.Channels) {
+            $key = Normalize-DeviceId (ConvertTo-PlainString $channel.Device.InstanceId)
+            if ([string]::IsNullOrWhiteSpace($key)) { continue }
+            $currentSettings[$key] = @{
+                Enabled = $true
+                GainDb = [double]$channel.GainDb
+                Mute = [bool]$channel.Mute
+                Priority = [bool]$channel.Priority
+                Solo = [bool]$channel.Solo
+            }
+        }
+        foreach ($key in @($currentSettings.Keys)) {
+            $config.Channels[$key] = $currentSettings[$key]
+        }
+
+        if ($RefreshInventory) {
+            if ($ApplicationState.Devices -and $ApplicationState.Devices.Count -gt 0) {
+                [void](Save-DeviceStateForDevices -ProjectRoot $ProjectRoot -Devices $ApplicationState.Devices -Logger $Logger)
+            }
+            $ApplicationState.Devices = @(Get-UsbMicrophoneInventory -ProjectRoot $ProjectRoot -Logger $Logger)
+        }
+
+        $providedDevices = @($ApplicationState.Devices)
+        $devices = @($providedDevices | Where-Object {
+            [bool](Get-ObjectPropertyValue -Object $_ -Name 'IsMicrophone' -Default $false) -and
+            (Test-DeviceRecordIsActive -Device $_) -and
+            -not [string]::IsNullOrWhiteSpace((ConvertTo-PlainString $_.EndpointGuid)) -and
+            (ConvertTo-PlainString $_.FriendlyName) -notmatch '^CABLE Output\b'
+        })
+
+        $desiredByKey = @{}
+        foreach ($device in $devices) {
+            $key = Normalize-DeviceId (ConvertTo-PlainString $device.InstanceId)
+            if (-not [string]::IsNullOrWhiteSpace($key) -and -not $desiredByKey.ContainsKey($key)) {
+                $desiredByKey[$key] = $device
+            }
+        }
+
+        if ($mixerState.Runtime) {
+            foreach ($runtimeChannel in @($mixerState.Runtime.Channels)) {
+                if (-not $desiredByKey.ContainsKey($runtimeChannel.Key)) {
+                    Remove-AudioGraphMixerInput -Runtime $mixerState.Runtime -Key $runtimeChannel.Key -Logger $Logger
+                }
+            }
+
+            $captureByGuid = Get-AudioGraphCaptureDeviceMap
+            foreach ($key in @($desiredByKey.Keys)) {
+                if (@($mixerState.Runtime.Channels | Where-Object { $_.Key -eq $key }).Count -gt 0) { continue }
+                try {
+                    [void](Add-AudioGraphMixerInput -Runtime $mixerState.Runtime -Device $desiredByKey[$key] -CaptureByGuid $captureByGuid -Logger $Logger)
+                }
+                catch {
+                    Write-AppLog -Message ("Adding live mixer input failed for {0}: {1}" -f $desiredByKey[$key].FriendlyName, $_.Exception.Message) -Level ERROR -Logger $Logger
+                }
+            }
+        }
+
         $channelHost.SuspendLayout()
         try {
-            $channelHost.Controls.Clear()
-            $mixerState.Channels = @()
+            foreach ($control in @($channelHost.Controls)) {
+                $control.Dispose()
+            }
+            $newChannels = @()
             $seen = @{}
-            $providedDevices = @($ApplicationState.Devices)
-            $devices = @($providedDevices | Where-Object {
-                [bool](Get-ObjectPropertyValue -Object $_ -Name 'IsMicrophone' -Default $false) -and
-                (Test-DeviceRecordIsActive -Device $_) -and
-                -not [string]::IsNullOrWhiteSpace((ConvertTo-PlainString $_.EndpointGuid)) -and
-                (ConvertTo-PlainString $_.FriendlyName) -notmatch '^CABLE Output\b'
-            })
+            $priorityAssigned = $false
+            $soloAssigned = $false
 
             foreach ($device in $devices) {
                 $key = Normalize-DeviceId (ConvertTo-PlainString $device.InstanceId)
                 if ([string]::IsNullOrWhiteSpace($key) -or $seen.ContainsKey($key)) { continue }
                 $seen[$key] = $true
                 $saved = $null
-                if ($config.Channels.ContainsKey($key)) { $saved = $config.Channels[$key] }
-                $strip = New-AudioMixerChannelStrip -Device $device -SavedSettings $saved -OnChanged $applyMix
-                $mixerState.Channels += $strip
+                if ($currentSettings.ContainsKey($key)) {
+                    $saved = $currentSettings[$key]
+                }
+                elseif ($config.Channels.ContainsKey($key)) {
+                    $saved = $config.Channels[$key]
+                }
+                $strip = New-AudioMixerChannelStrip -Device $device -SavedSettings $saved -OnChanged $applyMix -OnPriority $setPriority -OnSolo $setSolo
+                if ($strip.Priority) {
+                    if ($priorityAssigned) {
+                        $strip.Priority = $false
+                        $refreshColors = $strip.UpdateSwitchColors
+                        & $refreshColors
+                    }
+                    else {
+                        $priorityAssigned = $true
+                    }
+                }
+                if ($strip.Solo) {
+                    if ($soloAssigned) {
+                        $strip.Solo = $false
+                        $refreshColors = $strip.UpdateSwitchColors
+                        & $refreshColors
+                    }
+                    else {
+                        $soloAssigned = $true
+                    }
+                }
+                $newChannels += $strip
                 [void]$channelHost.Controls.Add($strip.Panel)
             }
-            $statusLabel.Text = if ($mixerState.Channels.Count -gt 0) {
-                "{0} active microphone(s) ready. Output is silent until Start Mix is pressed." -f $mixerState.Channels.Count
-            }
-            else {
-                'No active devices marked as microphones are available.'
-            }
+            $mixerState.Channels = $newChannels
+            & $applyMix
         }
         finally {
             $channelHost.ResumeLayout()
         }
     }.GetNewClosure()
 
-    $btnStart.Add_Click({
+    $btnMix.Add_Click({
+        if ($mixerState.Runtime) {
+            & $stopMix
+            return
+        }
         try {
-            if ($mixerState.Runtime) { return }
             if ($null -eq $cmbOutput.SelectedItem) { throw 'CABLE Input playback endpoint was not found.' }
+            if ($null -eq $cmbLatency.SelectedItem) { throw 'Select an audio latency mode.' }
             if ($mixerState.Channels.Count -eq 0) { throw 'No active microphones are available for mixing.' }
             $devices = @($mixerState.Channels | ForEach-Object { $_.Device })
             $mixerState.Runtime = Start-AudioGraphMixer `
@@ -759,15 +1017,19 @@ function Show-AudioMixerWindow {
                 -OutputEndpoint $cmbOutput.SelectedItem `
                 -ChannelStates $mixerState.Channels `
                 -MasterDb ([double]$masterFader.Value) `
+                -LatencyMode (ConvertTo-PlainString $cmbLatency.SelectedItem.Mode) `
                 -Logger $Logger
-            $btnStart.Enabled = $false
-            $btnStop.Enabled = $true
+            $btnMix.Text = 'Stop Mix'
+            $mixBlinkState = $false
+            $btnMix.BackColor = [System.Drawing.Color]::FromArgb(22, 163, 74)
+            $mixBlinkTimer.Start()
             $cmbOutput.Enabled = $false
-            $statusLabel.Text = ("LIVE: {0} microphone(s) -> {1}. Select CABLE Output in OBS." -f $mixerState.Runtime.Channels.Count, $cmbOutput.SelectedItem.Name)
+            $cmbLatency.Enabled = $false
+            $btnRefresh.BackColor = $refreshButtonNormalColor
+            $btnRefresh.ForeColor = [System.Drawing.Color]::FromArgb(22, 32, 45)
         }
         catch {
             $mixerState.Runtime = $null
-            $statusLabel.Text = "Mixer start failed: $($_.Exception.Message)"
             Write-AppLog -Message ("Mixer start failed: {0}" -f $_.Exception.Message) -Level ERROR -Logger $Logger
             [void][System.Windows.Forms.MessageBox]::Show(
                 $form,
@@ -778,10 +1040,22 @@ function Show-AudioMixerWindow {
             )
         }
     }.GetNewClosure())
-    $btnStop.Add_Click({ & $stopMix }.GetNewClosure())
     $btnRefresh.Add_Click({
-        & $loadOutputs
-        & $loadChannels
+        try {
+            & $loadChannels $true
+            $btnRefresh.BackColor = $refreshButtonNormalColor
+            $btnRefresh.ForeColor = [System.Drawing.Color]::FromArgb(22, 32, 45)
+        }
+        catch {
+            Write-AppLog -Message ("Refreshing live mixer inputs failed: {0}" -f $_.Exception.Message) -Level ERROR -Logger $Logger
+            [void][System.Windows.Forms.MessageBox]::Show(
+                $form,
+                $_.Exception.Message,
+                'Refresh Mixer Inputs',
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            )
+        }
     }.GetNewClosure())
     $masterFader.Add_Scroll({
         $masterValue.Text = ('{0:+0;-0;0} dB' -f [double]$masterFader.Value)
@@ -818,16 +1092,21 @@ function Show-AudioMixerWindow {
 
     $form.Add_Shown({
         & $loadOutputs
-        & $loadChannels
+        & $loadChannels $false
         $meterTimer.Start()
-        if ($cmbOutput.Items.Count -eq 0) {
-            $statusLabel.Text = 'VB-CABLE playback endpoint CABLE Input was not found.'
-        }
     }.GetNewClosure())
     $form.Add_FormClosing({
         $meterTimer.Stop()
+        $mixBlinkTimer.Stop()
         & $stopMix
-        [void](Save-AudioMixerConfig -ProjectRoot $ProjectRoot -Channels $mixerState.Channels -MasterDb ([double]$masterFader.Value) -Logger $Logger)
+        $latencyMode = if ($cmbLatency.SelectedItem) {
+            ConvertTo-PlainString $cmbLatency.SelectedItem.Mode
+        }
+        else {
+            'LowestLatency'
+        }
+        [void](Save-AudioMixerConfig -ProjectRoot $ProjectRoot -Channels $mixerState.Channels -MasterDb ([double]$masterFader.Value) -LatencyMode $latencyMode -Logger $Logger)
+        $script:AudioMixerInputsChangedHandler = $null
         $script:AudioMixerWindow = $null
     }.GetNewClosure())
 

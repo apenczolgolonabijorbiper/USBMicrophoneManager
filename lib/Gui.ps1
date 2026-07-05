@@ -840,6 +840,7 @@ function Start-USBMicrophoneManagerGui {
             $value = [bool]$row.Cells['IsMicrophone'].Value
             $state.PendingMicFlags[$id] = $value
             Set-DeviceRecordEditsById -Devices $state.Devices -InstanceId $id -Edits @{ IsMicrophone = $value }
+            Set-AudioMixerInputsRefreshPending
         }
         elseif ($columnName -eq 'Alias1' -and -not [string]::IsNullOrWhiteSpace($vidPidKey)) {
             $value = ConvertTo-PlainString $row.Cells['Alias1'].Value
@@ -894,11 +895,16 @@ function Start-USBMicrophoneManagerGui {
                 Sync-GridEditsToDevices -Table $state.InactiveTable -Devices $state.Devices
             }
             & $applyPendingDeviceGridEdits
+            $previousMixerSignature = Get-AudioMixerDeviceSignature -Devices $state.Devices
             if ($state.Devices -and $state.Devices.Count -gt 0) {
                 [void](Save-DeviceStateForDevices -ProjectRoot $state.ProjectRoot -Devices $state.Devices -Logger $logger)
             }
             $state.Devices = @(Get-UsbMicrophoneInventory -ProjectRoot $state.ProjectRoot -Logger $logger)
             & $applyPendingDeviceGridEdits
+            $currentMixerSignature = Get-AudioMixerDeviceSignature -Devices $state.Devices
+            if ($currentMixerSignature -ne $previousMixerSignature) {
+                Set-AudioMixerInputsRefreshPending
+            }
         }
 
         if ($state.ApoScanEnabled -and $state.ApoInfo) {
