@@ -238,6 +238,20 @@ function Get-UsbMicrophoneInventory {
         $devices = @(Set-EndpointMapping -Devices $devices -Endpoints $endpoints)
     }
 
+    $defaultEndpointId = Normalize-DeviceId (Get-DefaultCaptureAudioEndpointId -Logger $Logger)
+    $defaultCommEndpointId = Normalize-DeviceId (Get-DefaultCommunicationsCaptureAudioEndpointId -Logger $Logger)
+    foreach ($device in $devices) {
+        $deviceEndpointId = Normalize-DeviceId (ConvertTo-PlainString $device.EndpointId)
+        $device.IsDefault = (
+            -not [string]::IsNullOrWhiteSpace($defaultEndpointId) -and
+            $deviceEndpointId -eq $defaultEndpointId
+        )
+        $device.IsDefaultComm = (
+            -not [string]::IsNullOrWhiteSpace($defaultCommEndpointId) -and
+            $deviceEndpointId -eq $defaultCommEndpointId
+        )
+    }
+
     $devices = @(Apply-AliasesToDevices -Devices $devices -AliasMap $aliases)
     $devices = @(Apply-DeviceStateToDevices -Devices $devices -StateMap $deviceStateMap)
     $deviceStateMap = Update-DeviceStateForDevices -Devices $devices -StateMap $deviceStateMap

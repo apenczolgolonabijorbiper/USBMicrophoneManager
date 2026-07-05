@@ -69,6 +69,8 @@ function Convert-DevicesToDataTable {
 
     $table = New-Object System.Data.DataTable
     [void]$table.Columns.Add('IsMicrophone', [bool])
+    [void]$table.Columns.Add('IsDefault', [bool])
+    [void]$table.Columns.Add('IsDefaultComm', [bool])
     foreach ($name in @('State','Alias1','Alias2','Alias3','Alias4','FriendlyName','VID','PID','InstanceId','ContainerId','EndpointGuid','UsbPort','Location','Driver','Status','Level','APO','Processing','LastActive','EndpointId','LocationPath','BusRelations','ParentDevice','BusNumber','Address')) {
         [void]$table.Columns.Add($name, [string])
     }
@@ -80,8 +82,9 @@ function Convert-DevicesToDataTable {
             if ($name -eq 'Level') {
                 $row[$name] = ('{0:P0}' -f [double](Get-ObjectPropertyValue -Object $device -Name 'Level' -Default 0))
             }
-            elseif ($name -eq 'IsMicrophone') {
-                $row[$name] = [bool](Get-ObjectPropertyValue -Object $device -Name 'IsMicrophone' -Default $true)
+            elseif ($name -eq 'IsMicrophone' -or $name -eq 'IsDefault' -or $name -eq 'IsDefaultComm') {
+                $defaultValue = ($name -eq 'IsMicrophone')
+                $row[$name] = [bool](Get-ObjectPropertyValue -Object $device -Name $name -Default $defaultValue)
             }
             elseif ($name -eq 'State') {
                 $row[$name] = Convert-DeviceStatusToDisplayState -Status (ConvertTo-PlainString (Get-ObjectPropertyValue -Object $device -Name 'Status' -Default ''))
@@ -140,11 +143,17 @@ function Add-DeviceGridColumns {
     <# Adds the microphone columns to a device grid. #>
     param(
         [Parameter(Mandatory=$true)][System.Windows.Forms.DataGridView]$Grid,
+        [bool]$IncludeLevel = $true,
         [bool]$IncludeLastActive = $false
     )
 
     Add-GridColumn -Grid $Grid -Name 'State' -Header 'State' -Width 120
-    Add-GridCheckBoxColumn -Grid $Grid -Name 'IsMicrophone' -Header 'Mic' -ReadOnly $false -Width 55
+    Add-GridCheckBoxColumn -Grid $Grid -Name 'IsMicrophone' -Header 'Mix' -ReadOnly $false -Width 55
+    if ($IncludeLevel) {
+        Add-GridColumn -Grid $Grid -Name 'Level' -Header 'Level' -Width 70
+    }
+    Add-GridCheckBoxColumn -Grid $Grid -Name 'IsDefault' -Header 'Default' -ReadOnly $true -Width 65
+    Add-GridCheckBoxColumn -Grid $Grid -Name 'IsDefaultComm' -Header 'Comm' -ReadOnly $true -Width 55
     Add-GridColumn -Grid $Grid -Name 'Alias1' -Header 'Alias1 (VID/PID)' -ReadOnly $false -Width 150
     Add-GridColumn -Grid $Grid -Name 'Alias2' -Header 'Alias2 (InstanceId)' -ReadOnly $false -Width 160
     Add-GridColumn -Grid $Grid -Name 'Alias3' -Header 'Alias3 (ContainerId)' -ReadOnly $false -Width 160
@@ -155,11 +164,7 @@ function Add-DeviceGridColumns {
     Add-GridColumn -Grid $Grid -Name 'InstanceId' -Header 'InstanceId' -Width 260
     Add-GridColumn -Grid $Grid -Name 'ContainerId' -Header 'ContainerId' -Width 180
     Add-GridColumn -Grid $Grid -Name 'EndpointGuid' -Header 'Endpoint GUID' -Width 170
-    Add-GridColumn -Grid $Grid -Name 'UsbPort' -Header 'USB Port' -Width 160
-    Add-GridColumn -Grid $Grid -Name 'Location' -Header 'Location' -Width 160
     Add-GridColumn -Grid $Grid -Name 'Driver' -Header 'Driver' -Width 150
-    Add-GridColumn -Grid $Grid -Name 'Status' -Header 'Status' -Width 90
-    Add-GridColumn -Grid $Grid -Name 'Level' -Header 'Level' -Width 70
     Add-GridColumn -Grid $Grid -Name 'APO' -Header 'APO' -Width 130
     Add-GridColumn -Grid $Grid -Name 'Processing' -Header 'Processing' -Width 280
     if ($IncludeLastActive) {
@@ -280,12 +285,17 @@ function Convert-DeviceStatusToDisplayState {
 
 function Set-GridStatusColors {
     <# Applies status and signal colors to DataGridView rows. #>
-    param([Parameter(Mandatory=$true)][System.Windows.Forms.DataGridView]$Grid)
+    param(
+        [Parameter(Mandatory=$true)][System.Windows.Forms.DataGridView]$Grid,
+        [bool]$MeterEnabled = $false
+    )
 
     foreach ($row in $Grid.Rows) {
         if ($row.IsNewRow) { continue }
         Set-GridRowBaseStyle -Row $row
-        Set-LevelCellStyle -Row $row
+        if ($Grid.Columns.Contains('Level')) {
+            Set-LevelCellStyle -Row $row -MeterEnabled $MeterEnabled
+        }
     }
 }
 
@@ -323,20 +333,31 @@ function Set-GridRowBaseStyle {
 
 function Set-LevelCellStyle {
     <# Applies the meter color to only one row's Level cell. #>
-    param([Parameter(Mandatory=$true)][System.Windows.Forms.DataGridViewRow]$Row)
+    param(
+        [Parameter(Mandatory=$true)][System.Windows.Forms.DataGridViewRow]$Row,
+        [bool]$MeterEnabled = $false
+    )
 
     $levelText = ''
     if ($Row.Cells['Level'].Value) { $levelText = [string]$Row.Cells['Level'].Value }
 
-    if ($levelText -match '^(\d+)') {
-        $percent = [int]$matches[1]
-        if ($percent -ge 20) {
-            $Row.Cells['Level'].Style.BackColor = [System.Drawing.Color]::FromArgb(187, 247, 208)
-        }
-        else {
-            $Row.Cells['Level'].Style.BackColor = [System.Drawing.Color]::FromArgb(241, 245, 249)
-        }
+    if (-not $MeterEnabled) {
+        $Row.Cells['Level'].Style.BackColor = [System.Drawing.Color]::FromArgb(241, 245, 249)
+        return
     }
+
+    $percent = 0
+    if ($levelText -match '^(\d+)') {
+        $percent = [Math]::Max(0, [Math]::Min(100, [int]$matches[1]))
+    }
+
+    $baseColor = $Row.DefaultCellStyle.BackColor
+    $meterColor = [System.Drawing.Color]::FromArgb(34, 197, 94)
+    $ratio = $percent / 100.0
+    $red = [int][Math]::Round($baseColor.R + (($meterColor.R - $baseColor.R) * $ratio))
+    $green = [int][Math]::Round($baseColor.G + (($meterColor.G - $baseColor.G) * $ratio))
+    $blue = [int][Math]::Round($baseColor.B + (($meterColor.B - $baseColor.B) * $ratio))
+    $Row.Cells['Level'].Style.BackColor = [System.Drawing.Color]::FromArgb($red, $green, $blue)
 }
 
 function Set-DeviceFilter {
@@ -431,6 +452,8 @@ function Get-AudioEndpointStateSignature {
             (ConvertTo-PlainString $endpoint.State), `
             (ConvertTo-PlainString (Get-ObjectPropertyValue -Object $endpoint -Name 'PnpInstanceId' -Default '')))
     }
+    $parts += ('DEFAULT|{0}' -f (Get-DefaultCaptureAudioEndpointId -Logger $Logger -Quiet))
+    $parts += ('COMM|{0}' -f (Get-DefaultCommunicationsCaptureAudioEndpointId -Logger $Logger -Quiet))
     return ($parts -join "`n")
 }
 
@@ -514,7 +537,7 @@ function Start-USBMicrophoneManagerGui {
     $form.Size = New-Object System.Drawing.Size(1280, 780)
     $form.MinimumSize = New-Object System.Drawing.Size(980, 620)
     $form.BackColor = [System.Drawing.Color]::FromArgb(245, 247, 250)
-    $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $form.Font = New-Object System.Drawing.Font('Segoe UI Emoji', 9)
 
     $main = New-Object System.Windows.Forms.TableLayoutPanel
     $main.Dock = 'Fill'
@@ -540,19 +563,17 @@ function Start-USBMicrophoneManagerGui {
     $toolbar.WrapContents = $true
     $toolbar.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
 
-    $btnSave = New-ToolbarButton -Text 'Save' -Icon 'S'
-    $btnRefresh = New-ToolbarButton -Text 'Refresh' -Icon 'R'
-    $btnExport = New-ToolbarButton -Text 'Export CSV' -Icon 'CSV'
-    $btnCopyInstance = New-ToolbarButton -Text 'Copy InstanceId' -Icon 'ID'
-    $btnCopyEndpoint = New-ToolbarButton -Text 'Copy Endpoint GUID' -Icon 'GUID'
-    $btnDeviceManager = New-ToolbarButton -Text 'Device Manager' -Icon 'DEV'
-    $btnSound = New-ToolbarButton -Text 'Sound Settings' -Icon 'SND'
-    $btnApo = New-ToolbarButton -Text 'Scan APO' -Icon 'APO'
-    $btnMixer = New-ToolbarButton -Text 'Mixer' -Icon 'MIX'
-    $btnMeter = New-ToolbarButton -Text 'Meter Off' -Icon 'LVL'
-    $btnTest = New-ToolbarButton -Text 'Test' -Icon 'TEST'
+    $btnSave = New-ToolbarButton -Text 'Save' -Icon ([char]::ConvertFromUtf32(0x1F4BE))
+    $btnRefresh = New-ToolbarButton -Text 'Refresh' -Icon ([char]::ConvertFromUtf32(0x1F504))
+    $btnExport = New-ToolbarButton -Text 'Export CSV' -Icon ([char]::ConvertFromUtf32(0x1F4C4))
+    $btnDeviceManager = New-ToolbarButton -Text 'Devices' -Icon ([char]0x2699)
+    $btnSound = New-ToolbarButton -Text 'Settings' -Icon ([char]::ConvertFromUtf32(0x1F50A))
+    $btnApo = New-ToolbarButton -Text 'Scan APO' -Icon ([char]::ConvertFromUtf32(0x1F50D))
+    $btnMixer = New-ToolbarButton -Text 'Mixer' -Icon ([char]::ConvertFromUtf32(0x1F39A))
+    $btnMeter = New-ToolbarButton -Text 'Meter Off' -Icon ([char]::ConvertFromUtf32(0x1F4CA))
+    $btnTest = New-ToolbarButton -Text 'Test' -Icon ([char]0x25B6)
 
-    foreach ($button in @($btnSave,$btnRefresh,$btnExport,$btnCopyInstance,$btnCopyEndpoint,$btnDeviceManager,$btnSound,$btnApo,$btnMixer,$btnMeter,$btnTest)) {
+    foreach ($button in @($btnSave,$btnRefresh,$btnExport,$btnDeviceManager,$btnSound,$btnApo,$btnMixer,$btnMeter,$btnTest)) {
         [void]$toolbar.Controls.Add($button)
     }
     $main.Controls.Add($toolbar, 0, 0)
@@ -649,7 +670,7 @@ function Start-USBMicrophoneManagerGui {
     $lblInactive.Font = New-Object System.Drawing.Font($form.Font, [System.Drawing.FontStyle]::Bold)
     $inactiveGrid = New-Object System.Windows.Forms.DataGridView
     Configure-DeviceGrid -Grid $inactiveGrid
-    Add-DeviceGridColumns -Grid $inactiveGrid -IncludeLastActive $true
+    Add-DeviceGridColumns -Grid $inactiveGrid -IncludeLevel $false -IncludeLastActive $true
     $inactivePanel.Controls.Add($lblInactive, 0, 0)
     $inactivePanel.Controls.Add($inactiveGrid, 0, 1)
 
@@ -735,10 +756,10 @@ function Start-USBMicrophoneManagerGui {
     $apoButtons = New-Object System.Windows.Forms.FlowLayoutPanel
     $apoButtons.Dock = 'Fill'
     $apoButtons.WrapContents = $true
-    $btnApoRefreshPanel = New-ToolbarButton -Text 'Refresh APO' -Icon 'APO'
-    $btnApoSnapshot = New-ToolbarButton -Text 'Save Snapshot' -Icon 'SAVE'
-    $btnApoApplyPreset = New-ToolbarButton -Text 'Apply Preset' -Icon 'LOAD'
-    $btnApoApplyToggles = New-ToolbarButton -Text 'Apply Toggles' -Icon 'ON'
+    $btnApoRefreshPanel = New-ToolbarButton -Text 'Refresh APO' -Icon ([char]::ConvertFromUtf32(0x1F504))
+    $btnApoSnapshot = New-ToolbarButton -Text 'Save Snapshot' -Icon ([char]::ConvertFromUtf32(0x1F4BE))
+    $btnApoApplyPreset = New-ToolbarButton -Text 'Apply Preset' -Icon ([char]::ConvertFromUtf32(0x1F4C2))
+    $btnApoApplyToggles = New-ToolbarButton -Text 'Apply Toggles' -Icon ([char]0x2714)
     foreach ($button in @($btnApoRefreshPanel,$btnApoSnapshot,$btnApoApplyPreset,$btnApoApplyToggles)) {
         [void]$apoButtons.Controls.Add($button)
     }
@@ -898,8 +919,8 @@ function Start-USBMicrophoneManagerGui {
         $lblActive.Text = ("Active devices ({0})" -f $activeDevices.Count)
         $lblInactive.Text = ("Inactive devices ({0})" -f $inactiveDevices.Count)
         $lblCount.Text = ("{0} total" -f $state.Devices.Count)
-        Set-GridStatusColors -Grid $activeGrid
-        Set-GridStatusColors -Grid $inactiveGrid
+        Set-GridStatusColors -Grid $activeGrid -MeterEnabled $state.MeterEnabled
+        Set-GridStatusColors -Grid $inactiveGrid -MeterEnabled $state.MeterEnabled
     }
 
     $setApoPanelAvailable = {
@@ -1029,6 +1050,7 @@ function Start-USBMicrophoneManagerGui {
             $btnMeter.Text = 'LVL  Meter On'
             $btnMeter.BackColor = [System.Drawing.Color]::FromArgb(187, 247, 208)
             if (-not $meterTimer.Enabled) { $meterTimer.Start() }
+            Set-GridStatusColors -Grid $activeGrid -MeterEnabled $true
             Write-AppLog -Message ("Audio meter enabled{0}." -f $Reason) -Level INFO -Logger $logger
         }
         else {
@@ -1047,8 +1069,8 @@ function Start-USBMicrophoneManagerGui {
             if ($state.InactiveTable -is [System.Data.DataTable]) {
                 foreach ($dataRow in $state.InactiveTable.Rows) { $dataRow['Level'] = '0%' }
             }
-            Set-GridStatusColors -Grid $activeGrid
-            Set-GridStatusColors -Grid $inactiveGrid
+            Set-GridStatusColors -Grid $activeGrid -MeterEnabled $false
+            Set-GridStatusColors -Grid $inactiveGrid -MeterEnabled $false
             Write-AppLog -Message 'Audio meter disabled.' -Level INFO -Logger $logger
         }
     }
@@ -1092,8 +1114,6 @@ function Start-USBMicrophoneManagerGui {
         Export-GridToCsv -Table $exportTable -Logger $logger
     })
 
-    $btnCopyInstance.Add_Click({ & $copyValue 'InstanceId' })
-    $btnCopyEndpoint.Add_Click({ & $copyValue 'EndpointGuid' })
     $miCopyInstance.Add_Click({ & $copyValue 'InstanceId' })
     $miCopyEndpoint.Add_Click({ & $copyValue 'EndpointGuid' })
     $miCopyRow.Add_Click({
@@ -1228,8 +1248,8 @@ function Start-USBMicrophoneManagerGui {
         else {
             $btnTest.BackColor = [System.Drawing.Color]::FromArgb(248, 250, 252)
             $state.LastLoudestId = ''
-            Set-GridStatusColors -Grid $activeGrid
-            Set-GridStatusColors -Grid $inactiveGrid
+            Set-GridStatusColors -Grid $activeGrid -MeterEnabled $state.MeterEnabled
+            Set-GridStatusColors -Grid $inactiveGrid -MeterEnabled $state.MeterEnabled
             Write-AppLog -Message 'Test mode disabled.' -Level INFO -Logger $logger
         }
     })
@@ -1237,11 +1257,11 @@ function Start-USBMicrophoneManagerGui {
     $txtFilter.Add_TextChanged({
         if ($state.ActiveView) {
             Set-DeviceFilter -View $state.ActiveView -FilterText $txtFilter.Text -OnlyMicrophones $state.OnlyMicrophones
-            Set-GridStatusColors -Grid $activeGrid
+            Set-GridStatusColors -Grid $activeGrid -MeterEnabled $state.MeterEnabled
         }
         if ($state.InactiveView) {
             Set-DeviceFilter -View $state.InactiveView -FilterText $txtFilter.Text -OnlyMicrophones $state.OnlyMicrophones
-            Set-GridStatusColors -Grid $inactiveGrid
+            Set-GridStatusColors -Grid $inactiveGrid -MeterEnabled $state.MeterEnabled
         }
     })
 
@@ -1249,11 +1269,11 @@ function Start-USBMicrophoneManagerGui {
         $state.OnlyMicrophones = [bool]$chkOnlyMicrophones.Checked
         if ($state.ActiveView) {
             Set-DeviceFilter -View $state.ActiveView -FilterText $txtFilter.Text -OnlyMicrophones $state.OnlyMicrophones
-            Set-GridStatusColors -Grid $activeGrid
+            Set-GridStatusColors -Grid $activeGrid -MeterEnabled $state.MeterEnabled
         }
         if ($state.InactiveView) {
             Set-DeviceFilter -View $state.InactiveView -FilterText $txtFilter.Text -OnlyMicrophones $state.OnlyMicrophones
-            Set-GridStatusColors -Grid $inactiveGrid
+            Set-GridStatusColors -Grid $inactiveGrid -MeterEnabled $state.MeterEnabled
         }
     })
 
@@ -1270,6 +1290,40 @@ function Start-USBMicrophoneManagerGui {
         }
     })
 
+    $setGridRowAsDefault = {
+        param(
+            [System.Windows.Forms.DataGridView]$Grid,
+            [int]$RowIndex,
+            [int]$ColumnIndex
+        )
+
+        if ($RowIndex -lt 0 -or $ColumnIndex -lt 0) { return }
+        $columnName = $Grid.Columns[$ColumnIndex].Name
+        if ($columnName -ne 'IsDefault' -and $columnName -ne 'IsDefaultComm') { return }
+        $row = $Grid.Rows[$RowIndex]
+        if ([bool]$row.Cells[$columnName].Value) { return }
+
+        $endpointId = ''
+        if ($row.DataBoundItem -is [System.Data.DataRowView]) {
+            $endpointId = ConvertTo-PlainString $row.DataBoundItem['EndpointId']
+        }
+        if ([string]::IsNullOrWhiteSpace($endpointId)) {
+            Write-AppLog -Message 'This device has no Windows audio endpoint and cannot be made the default.' -Level WARN -Logger $logger
+            return
+        }
+
+        $changed = if ($columnName -eq 'IsDefaultComm') {
+            Set-DefaultCommunicationsCaptureAudioEndpoint -EndpointId $endpointId -Logger $logger
+        }
+        else {
+            Set-DefaultCaptureAudioEndpoint -EndpointId $endpointId -Logger $logger
+        }
+        if ($changed) {
+            $state.LastEndpointSignature = Get-AudioEndpointStateSignature -Logger $logger
+            & $refreshGrid $true
+        }
+    }
+
     $activeGrid.Add_CellFormatting({
         param($sender, $e)
         if ($activeGrid.Columns[$e.ColumnIndex].Name -eq 'Level') {
@@ -1283,6 +1337,10 @@ function Start-USBMicrophoneManagerGui {
         param($sender, $e)
         & $rememberDeviceGridEdit $activeGrid $e.RowIndex $e.ColumnIndex
     })
+    $activeGrid.Add_CellDoubleClick({
+        param($sender, $e)
+        & $setGridRowAsDefault $activeGrid $e.RowIndex $e.ColumnIndex
+    })
     $inactiveGrid.Add_CellFormatting({
         param($sender, $e)
         if ($inactiveGrid.Columns[$e.ColumnIndex].Name -eq 'Level') {
@@ -1295,6 +1353,10 @@ function Start-USBMicrophoneManagerGui {
     $inactiveGrid.Add_CellValueChanged({
         param($sender, $e)
         & $rememberDeviceGridEdit $inactiveGrid $e.RowIndex $e.ColumnIndex
+    })
+    $inactiveGrid.Add_CellDoubleClick({
+        param($sender, $e)
+        & $setGridRowAsDefault $inactiveGrid $e.RowIndex $e.ColumnIndex
     })
 
     $meterTimer = New-Object System.Windows.Forms.Timer
@@ -1320,7 +1382,7 @@ function Start-USBMicrophoneManagerGui {
                 $newLevelText = ('{0:P0}' -f $levelById[$id])
                 if ((ConvertTo-PlainString $gridRow.Cells['Level'].Value) -ne $newLevelText) {
                     $gridRow.Cells['Level'].Value = $newLevelText
-                    Set-LevelCellStyle -Row $gridRow
+                    Set-LevelCellStyle -Row $gridRow -MeterEnabled $true
                 }
             }
 

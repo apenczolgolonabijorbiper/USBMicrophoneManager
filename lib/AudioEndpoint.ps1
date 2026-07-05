@@ -69,6 +69,47 @@ namespace USBMicrophoneManager {
             return list.ToArray();
         }
 
+        public static string GetDefaultCaptureEndpointId(int role) {
+            IMMDeviceEnumerator enumerator = (IMMDeviceEnumerator)(new MMDeviceEnumerator());
+            IMMDevice device = null;
+            try {
+                int hr = enumerator.GetDefaultAudioEndpoint(EDataFlow.eCapture, role, out device);
+                if (hr != 0 || device == null) return "";
+                string id;
+                hr = device.GetId(out id);
+                if (hr != 0) return "";
+                return id ?? "";
+            }
+            finally {
+                if (device != null) Marshal.ReleaseComObject(device);
+                if (enumerator != null) Marshal.ReleaseComObject(enumerator);
+            }
+        }
+
+        public static int SetDefaultCaptureEndpoint(string endpointId) {
+            if (String.IsNullOrEmpty(endpointId)) return -1;
+            IPolicyConfig policy = (IPolicyConfig)(new PolicyConfigClient());
+            try {
+                int hr = policy.SetDefaultEndpoint(endpointId, 0);
+                if (hr != 0) return hr;
+                return policy.SetDefaultEndpoint(endpointId, 1);
+            }
+            finally {
+                if (policy != null) Marshal.ReleaseComObject(policy);
+            }
+        }
+
+        public static int SetDefaultCaptureEndpointForRole(string endpointId, int role) {
+            if (String.IsNullOrEmpty(endpointId)) return -1;
+            IPolicyConfig policy = (IPolicyConfig)(new PolicyConfigClient());
+            try {
+                return policy.SetDefaultEndpoint(endpointId, role);
+            }
+            finally {
+                if (policy != null) Marshal.ReleaseComObject(policy);
+            }
+        }
+
         public static float GetPeakValue(string endpointId) {
             if (String.IsNullOrEmpty(endpointId)) return 0;
             IMMDeviceEnumerator enumerator = (IMMDeviceEnumerator)(new MMDeviceEnumerator());
@@ -236,6 +277,25 @@ namespace USBMicrophoneManager {
         [PreserveSig]
         int QueryHardwareSupport(out int pdwHardwareSupportMask);
     }
+
+    [ComImport, Guid("870AF99C-171D-4F9E-AF0D-E63DF40C2BC9")]
+    public class PolicyConfigClient { }
+
+    [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("F8679F50-850A-41CF-9C72-430F290290C8")]
+    public interface IPolicyConfig {
+        [PreserveSig] int GetMixFormat([MarshalAs(UnmanagedType.LPWStr)] string deviceId, IntPtr format);
+        [PreserveSig] int GetDeviceFormat([MarshalAs(UnmanagedType.LPWStr)] string deviceId, int defaultFormat, IntPtr format);
+        [PreserveSig] int ResetDeviceFormat([MarshalAs(UnmanagedType.LPWStr)] string deviceId);
+        [PreserveSig] int SetDeviceFormat([MarshalAs(UnmanagedType.LPWStr)] string deviceId, IntPtr endpointFormat, IntPtr mixFormat);
+        [PreserveSig] int GetProcessingPeriod([MarshalAs(UnmanagedType.LPWStr)] string deviceId, int defaultPeriod, IntPtr period, IntPtr minimumPeriod);
+        [PreserveSig] int SetProcessingPeriod([MarshalAs(UnmanagedType.LPWStr)] string deviceId, IntPtr period);
+        [PreserveSig] int GetShareMode([MarshalAs(UnmanagedType.LPWStr)] string deviceId, IntPtr mode);
+        [PreserveSig] int SetShareMode([MarshalAs(UnmanagedType.LPWStr)] string deviceId, IntPtr mode);
+        [PreserveSig] int GetPropertyValue([MarshalAs(UnmanagedType.LPWStr)] string deviceId, IntPtr key, IntPtr value);
+        [PreserveSig] int SetPropertyValue([MarshalAs(UnmanagedType.LPWStr)] string deviceId, IntPtr key, IntPtr value);
+        [PreserveSig] int SetDefaultEndpoint([MarshalAs(UnmanagedType.LPWStr)] string deviceId, int role);
+        [PreserveSig] int SetEndpointVisibility([MarshalAs(UnmanagedType.LPWStr)] string deviceId, int visible);
+    }
 }
 "@
 
@@ -253,6 +313,96 @@ function Get-CaptureAudioEndpoints {
     param([scriptblock]$Logger)
 
     return @(Get-CaptureAudioEndpointsFromRegistry -Logger $Logger)
+}
+
+function Get-DefaultCaptureAudioEndpointId {
+    <# Returns the Windows default capture endpoint for the normal console role. #>
+    param(
+        [scriptblock]$Logger,
+        [switch]$Quiet
+    )
+
+    Initialize-AudioEndpointApi -Logger $Logger
+    if (-not ('USBMicrophoneManager.AudioApi' -as [type])) { return '' }
+
+    try {
+        return ConvertTo-PlainString ([USBMicrophoneManager.AudioApi]::GetDefaultCaptureEndpointId(0))
+    }
+    catch {
+        if (-not $Quiet) {
+            Write-AppLog -Message ("Default capture endpoint lookup failed: {0}" -f $_.Exception.Message) -Level WARN -Logger $Logger
+        }
+        return ''
+    }
+}
+
+function Get-DefaultCommunicationsCaptureAudioEndpointId {
+    <# Returns the Windows default capture endpoint for communications applications. #>
+    param(
+        [scriptblock]$Logger,
+        [switch]$Quiet
+    )
+
+    Initialize-AudioEndpointApi -Logger $Logger
+    if (-not ('USBMicrophoneManager.AudioApi' -as [type])) { return '' }
+
+    try {
+        return ConvertTo-PlainString ([USBMicrophoneManager.AudioApi]::GetDefaultCaptureEndpointId(2))
+    }
+    catch {
+        if (-not $Quiet) {
+            Write-AppLog -Message ("Default communications capture endpoint lookup failed: {0}" -f $_.Exception.Message) -Level WARN -Logger $Logger
+        }
+        return ''
+    }
+}
+
+function Set-DefaultCaptureAudioEndpoint {
+    <# Sets a capture endpoint as the normal Windows default for console and multimedia applications. #>
+    param(
+        [Parameter(Mandatory=$true)][string]$EndpointId,
+        [scriptblock]$Logger
+    )
+
+    Initialize-AudioEndpointApi -Logger $Logger
+    if (-not ('USBMicrophoneManager.AudioApi' -as [type])) { return $false }
+
+    try {
+        $result = [USBMicrophoneManager.AudioApi]::SetDefaultCaptureEndpoint($EndpointId)
+        if ($result -ne 0) {
+            throw (New-Object System.Runtime.InteropServices.COMException('Setting the default capture endpoint failed.', $result))
+        }
+        Write-AppLog -Message ("Default recording endpoint changed to {0}." -f $EndpointId) -Level DEVICE -Logger $Logger
+        return $true
+    }
+    catch {
+        Write-AppLog -Message ("Changing the default recording endpoint failed: {0}" -f $_.Exception.Message) -Level ERROR -Logger $Logger
+        return $false
+    }
+}
+
+function Set-DefaultCommunicationsCaptureAudioEndpoint {
+    <# Sets a capture endpoint as the Windows default for communications applications. #>
+    param(
+        [Parameter(Mandatory=$true)][string]$EndpointId,
+        [scriptblock]$Logger
+    )
+
+    Initialize-AudioEndpointApi -Logger $Logger
+    if (-not ('USBMicrophoneManager.AudioApi' -as [type])) { return $false }
+
+    try {
+        $result = [USBMicrophoneManager.AudioApi]::SetDefaultCaptureEndpointForRole($EndpointId, 2)
+        if ($result -ne 0) {
+            throw (New-Object System.Runtime.InteropServices.COMException('Setting the default communications capture endpoint failed.', $result))
+        }
+        Write-AppLog -Message ("Default communications recording endpoint changed to {0}." -f $EndpointId) -Level DEVICE -Logger $Logger
+        return $true
+    }
+    catch {
+        Write-AppLog -Message ("Changing the default communications recording endpoint failed: {0}" -f $_.Exception.Message) -Level ERROR -Logger $Logger
+        return $false
+    }
 }
 
 function Get-CaptureAudioEndpointsFromRegistry {

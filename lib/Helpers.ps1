@@ -177,6 +177,8 @@ function New-MicrophoneRecord {
         [double]$Level = 0,
         [string]$LastActive = '',
         [bool]$IsMicrophone = $true,
+        [bool]$IsDefault = $false,
+        [bool]$IsDefaultComm = $false,
         [string]$Apo = '',
         [string]$Processing = ''
     )
@@ -205,6 +207,8 @@ function New-MicrophoneRecord {
         Level = $Level
         LastActive = $LastActive
         IsMicrophone = $IsMicrophone
+        IsDefault = $IsDefault
+        IsDefaultComm = $IsDefaultComm
         Apo = $Apo
         Processing = $Processing
     })

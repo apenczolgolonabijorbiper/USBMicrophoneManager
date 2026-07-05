@@ -453,16 +453,22 @@ function New-AudioMixerChannelStrip {
 
     $switches = New-Object System.Windows.Forms.TableLayoutPanel
     $switches.Dock = 'Fill'
+    $switches.Margin = New-Object System.Windows.Forms.Padding(0)
+    $switches.Padding = New-Object System.Windows.Forms.Padding(0)
     $switches.ColumnCount = 2
+    $switches.RowCount = 1
     [void]$switches.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 50)))
     [void]$switches.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 50)))
+    [void]$switches.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Percent', 100)))
     $muteControl = New-Object System.Windows.Forms.Button
     $muteControl.Text = 'MUTE'
     $muteControl.Dock = 'Fill'
+    $muteControl.Margin = New-Object System.Windows.Forms.Padding(0, 2, 3, 2)
     $muteControl.FlatStyle = 'Flat'
     $soloControl = New-Object System.Windows.Forms.Button
     $soloControl.Text = 'SOLO'
     $soloControl.Dock = 'Fill'
+    $soloControl.Margin = New-Object System.Windows.Forms.Padding(3, 2, 0, 2)
     $soloControl.FlatStyle = 'Flat'
     $switches.Controls.Add($muteControl, 0, 0)
     $switches.Controls.Add($soloControl, 1, 0)
